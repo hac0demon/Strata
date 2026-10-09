@@ -17,6 +17,11 @@ void glm_swiglu(const float *gate, const float *up, float *y, int count, float l
 // `bonus` (optional, one value per expert) is added to the selection score only; weights keep the true scores.
 void glm_router(const float *logits, const float *correction, int *ids, float *weights, int experts,
                 int top_k, float scale, void *stream, const float *bonus = nullptr);
+// One token: glm_router followed by glm_mailbox_publish of the result and `x` into `slot`, as one launch.
+struct GlmMailboxView;
+void glm_router_publish(const float *logits, const float *correction, int *ids, float *weights, int experts,
+                        int top_k, float scale, const float *bonus, GlmMailboxView view, int slot, const float *x,
+                        const unsigned *generation, void *stream);
 
 // Four-stream mHC: projected is the 24-wide FP32 projection of normalized streams.
 // coefficients layout: pre[4], post[4], comb[4][4] (input stream, output stream).

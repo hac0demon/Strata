@@ -1,6 +1,7 @@
 // GLM-5.3-Flash equations follow the Transformers glm5_next reference.
 // https://github.com/huggingface/transformers/tree/main/src/transformers/models/glm5_next
 #include "strata/kernels/glm.hpp"
+#include "strata/kernels/glm_mailbox.hpp"
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -116,10 +117,9 @@ __global__ void route(const float *logits, const float *bias, int *ids, float *w
 // One warp caches each expert score once. Ties choose the first expert, as
 // in the serial scan; lane zero retains the original normalization order.
 // blockIdx.x selects the token; each token's selection is the single-token computation.
-__global__ void route_warp(const float *logits, const float *bias, int *ids, float *weights,
-                           int ne, int k, float scale, float min_share, const float *bonus) {
-    const int lane = threadIdx.x;
-    logits += (size_t)blockIdx.x * ne; ids += (size_t)blockIdx.x * k; weights += (size_t)blockIdx.x * k;
+__device__ __forceinline__ void route_warp_body(const float *logits, const float *bias, int *ids, float *weights,
+                                                int ne, int k, float scale, float min_share, const float *bonus,
+                                                int lane) {
     float scores[16];
     for (int i = 0; i < 16; ++i) {
         const int e = lane + 32 * i;
@@ -155,6 +155,35 @@ __global__ void route_warp(const float *logits, const float *bias, int *ids, flo
             weights[j] *= scale / (sum + 1e-20f);
             if (weights[j] < min_share * scale) weights[j] = 0.f;
         }
+}
+__global__ void route_warp(const float *logits, const float *bias, int *ids, float *weights,
+                           int ne, int k, float scale, float min_share, const float *bonus) {
+    route_warp_body(logits + (size_t)blockIdx.x * ne, bias, ids + (size_t)blockIdx.x * k,
+                    weights + (size_t)blockIdx.x * k, ne, k, scale, min_share, bonus, threadIdx.x);
+}
+// One token's router and mailbox publication in one launch (STRATA_GLM_FUSE_ROUTE=1): warp 0 routes, then the
+// block copies ids, weights and the activation into the mailbox slot and sets the published flag, exactly as the
+// separate publish kernel does (flags[slot * 32] is the published generation, see glm_mailbox.hpp).
+__global__ void route_publish(const float *logits, const float *bias, int *ids, float *weights, int ne, int k,
+                              float scale, float min_share, const float *bonus, GlmMailboxView v, int slot,
+                              const float *x, const unsigned *generation) {
+    if (threadIdx.x < 32) route_warp_body(logits, bias, ids, weights, ne, k, scale, min_share, bonus, threadIdx.x);
+    __syncthreads();
+    int *out_ids = v.ids + (size_t)slot * v.max_tokens * v.top_k;
+    float *out_weights = v.weights + (size_t)slot * v.max_tokens * v.top_k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+        out_ids[i] = ids[i];
+        out_weights[i] = weights[i];
+    }
+    const float4 *src = reinterpret_cast<const float4 *>(x);
+    float4 *dst = reinterpret_cast<float4 *>(v.act + (size_t)slot * v.max_tokens * v.hidden);
+    for (int i = threadIdx.x; i < v.hidden / 4; i += blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        *(volatile unsigned *)(v.flags + (size_t)slot * 32) = *generation;
+    }
 }
 // Opt-in lossy pruning (STRATA_GLM_ROUTE_MIN_SHARE): selected experts below this share of the routed weight get
 // weight zero, and the CPU expert service skips zero-weight routes. 0 (default) keeps every route.
@@ -531,6 +560,14 @@ void glm_router(const float *l, const float *b, int *ids, float *w, int ne, int 
         route_warp<<<1, 32, 0, (cudaStream_t)s>>>(l, b, ids, w, ne, k, scale, route_min_share(), bonus);
     else
         route<<<1, 1, 0, (cudaStream_t)s>>>(l, b, ids, w, ne, k, scale, route_min_share(), bonus);
+    check();
+}
+void glm_router_publish(const float *l, const float *b, int *ids, float *w, int ne, int k, float scale,
+                        const float *bonus, GlmMailboxView v, int slot, const float *x, const unsigned *generation,
+                        void *s) {
+    if (ne < 1 || k < 1 || k > ne || ne > 512 || k != v.top_k || slot < 0 || slot >= v.slots || v.hidden % 4)
+        throw std::invalid_argument("GLM: invalid fused routing geometry");
+    route_publish<<<1, 512, 0, (cudaStream_t)s>>>(l, b, ids, w, ne, k, scale, route_min_share(), bonus, v, slot, x, generation);
     check();
 }
 void glm_hc_project(const float *x, const float *w, float *out, float *scratch, int width, void *s) {
