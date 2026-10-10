@@ -12,6 +12,7 @@
 #include "strata/artifact/expert_calibration.hpp"
 #include "strata/artifact/expert_block_screen.hpp"
 #include "strata/artifact/json.hpp"
+#include "strata/spec/external_worker.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/numa_weights.hpp"
@@ -6894,6 +6895,10 @@ class Decoder {
         } catch (...) { capturing_history = false; throw; }
     }
     int vocabulary() const { return m.vocab; }
+    bool external_batch_exact() const {
+        return canon_experts && canon_strict() && !has_route_affinity() && !defer_experts &&
+               !ram_tier && !remote_tp && !multi_upstream && !gpu_decode_experts;
+    }
     void flush_expert_observer(){if(expert_observer)expert_observer->flush();if(block_screen)block_screen->report(std::cerr);}
     void set_block_screen_budget(int keep){if(!block_screen)throw std::invalid_argument("block sweep requires a screen profile");block_screen->uniform_budget(keep);}
     void set_block_screen_layer(int layer,int keep){if(!block_screen)throw std::invalid_argument("block sensitivity requires a screen profile");block_screen->layer_budget(layer,keep);}
@@ -8743,9 +8748,59 @@ struct LookupStats {
     double milliseconds = 0;
     bool stopped = false;
 };
+// Residency-biased routing and deferred residuals define a single-step target.
+// A batched verifier changes that target, so external proposals use ordinary
+// greedy steps here. This keeps the user's frozen routing and arithmetic.
+static LookupStats generate_external_sequential(Decoder& decoder, std::vector<float>& logits,
+    const std::vector<int>& prompt, int max_new, const std::vector<int>& stops, int depth,
+    const std::function<void(int)>& emit, bool report, strata::spec::ExternalWorker& external) {
+    const auto start=std::chrono::steady_clock::now();
+    auto elapsed=[](auto begin){return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-begin).count();};
+    LookupStats stats; std::vector<int> history=prompt;
+    double draft_ms=0,verify_ms=0;int calls=0;
+    std::array<int,7> proposed{},opportunities{},accepted{};
+    auto output=[&](int token){emit(token);history.push_back(token);++stats.generated;
+        stats.stopped=std::find(stops.begin(),stops.end(),token)!=stops.end();};
+    auto step=[&](int token){const auto begin=std::chrono::steady_clock::now();logits=decoder.step(token);verify_ms+=elapsed(begin);};
+    while(stats.generated<max_new&&!stats.stopped){
+        const int anchor=greedy(logits);output(anchor);
+        if(stats.stopped||stats.generated==max_new)break;
+        const auto begin=std::chrono::steady_clock::now();++calls;
+        const auto drafts=external.propose(history,std::min(depth,max_new-stats.generated),decoder.vocabulary());
+        draft_ms+=elapsed(begin);step(anchor);
+        if(!drafts.empty())++stats.rounds;
+        stats.proposed+=drafts.size();
+        for(size_t i=0;i<drafts.size();++i)++proposed[i];
+        for(size_t i=0;i<drafts.size();++i){
+            ++opportunities[i];if(drafts[i]!=greedy(logits))break;
+            ++accepted[i];++stats.accepted;output(drafts[i]);
+            if(stats.stopped||stats.generated==max_new)break;
+            step(drafts[i]);
+        }
+    }
+    stats.milliseconds=elapsed(start);
+    if(report){
+        std::cerr<<"SPECULATIVE source=external generated="<<stats.generated<<" rounds="<<stats.rounds
+                 <<" proposed="<<stats.proposed<<" accepted="<<stats.accepted<<" replayed=0 ms="<<stats.milliseconds
+                 <<" tok_s="<<std::max(0,stats.generated-1)*1000/stats.milliseconds<<" verification=sequential\n";
+        std::cerr<<"DRAFT_TIMING prepare_ms=0 draft_ms="<<draft_ms<<" verify_ms="<<verify_ms
+                 <<" restore_ms=0 proposal_calls="<<calls<<'\n';
+        for(int i=0;i<depth;++i)std::cerr<<"LOOKUP_POSITION index="<<i<<" proposed="<<proposed[i]
+            <<" opportunities="<<opportunities[i]<<" accepted="<<accepted[i]<<'\n';
+    }
+    return stats;
+}
 static LookupStats generate_lookup(Decoder &decoder, std::vector<float> &logits,
                                    const std::vector<int> &prompt, int max_new, const std::vector<int> &stops,
-                                   int depth, const std::function<void(int)> &emit, bool report = true) {
+                                   int depth, const std::function<void(int)> &emit, bool report = true,
+                                   strata::spec::ExternalWorker *external = nullptr) {
+    if (external && !decoder.external_batch_exact())
+        return generate_external_sequential(decoder,logits,prompt,max_new,stops,depth,emit,report,*external);
+    const auto start = std::chrono::steady_clock::now();
+    auto elapsed = [](auto begin) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(); };
+    double draft_ms = 0, verify_ms = 0, restore_ms = 0;
+    int proposal_calls = 0;
+    std::array<int,7> proposed_at{}, opportunities{}, accepted_at{};
     const int minimum_match = [] {
         const char *value = std::getenv("STRATA_GLM_LOOKUP_MIN_MATCH");
         if (!value) return cached_lookup_enabled() ? 6 : 3;
@@ -8755,14 +8810,17 @@ static LookupStats generate_lookup(Decoder &decoder, std::vector<float> &logits,
     }();
     strata::spec::SuffixDrafter lookup(minimum_match, 32, prompt.size() + max_new);
     lookup.append(prompt.data(), prompt.size());
+    std::vector<int> external_history;
+    if (external) external_history = prompt;
     decoder.compact_decode();
     auto checkpoint = decoder.checkpoint();
     decoder.enable_verify_history(depth);
     LookupStats stats;
-    const auto start = std::chrono::steady_clock::now();
+    const double prepare_ms = elapsed(start);
     auto output = [&](int token) {
         emit(token);
         lookup.append(token);
+        if (external) external_history.push_back(token);
         ++stats.generated;
         stats.stopped = std::find(stops.begin(), stops.end(), token) != stops.end();
     };
@@ -8772,26 +8830,42 @@ static LookupStats generate_lookup(Decoder &decoder, std::vector<float> &logits,
         if (stats.stopped || stats.generated == max_new)
             break;
         int32_t drafts[7];
-        const int k = lookup.propose(std::min(depth, max_new - stats.generated - 1), drafts);
+        const int maximum = std::min(depth, max_new - stats.generated - 1);
+        const auto draft_start = std::chrono::steady_clock::now();
+        if (maximum > 0) ++proposal_calls;
+        std::vector<int> proposals;
+        int k;
+        if (external) {
+            proposals = external->propose(external_history, maximum, decoder.vocabulary());
+            k = static_cast<int>(proposals.size());
+            std::copy(proposals.begin(), proposals.end(), drafts);
+        } else k = lookup.propose(maximum, drafts);
+        draft_ms += elapsed(draft_start);
         if (!k) {
             logits = decoder.step(anchor);
             continue;
         }
         std::vector<int> window{anchor};
         window.insert(window.end(), drafts, drafts + k);
+        const auto verify_start = std::chrono::steady_clock::now();
         decoder.save(checkpoint);
         auto all = decoder.verify(window);
+        verify_ms += elapsed(verify_start);
         ++stats.rounds;
         stats.proposed += k;
+        for (int i=0;i<k;++i) ++proposed_at[i];
         int accepted = 0;
-        while (accepted < k && drafts[accepted] == greedy(all, (size_t)accepted * decoder.vocabulary(),
-                                                          decoder.vocabulary())) {
+        while (accepted < k) {
+            ++opportunities[accepted];
+            if (drafts[accepted] != greedy(all, (size_t)accepted * decoder.vocabulary(), decoder.vocabulary())) break;
+            ++accepted_at[accepted];
             output(drafts[accepted]);
             ++accepted;
             if (stats.stopped)
                 break;
         }
         stats.accepted += accepted;
+        const auto restore_start = std::chrono::steady_clock::now();
         if (accepted != k || stats.stopped) {
             window.resize(accepted + 1 - int(stats.stopped));
             if (decoder.restore_verified(window.size())) {
@@ -8807,19 +8881,27 @@ static LookupStats generate_lookup(Decoder &decoder, std::vector<float> &logits,
         } else {
             logits.assign(all.end() - decoder.vocabulary(), all.end());
         }
+        restore_ms += elapsed(restore_start);
     }
     stats.milliseconds =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    if (report) std::cerr << "SPECULATIVE source=lookup generated=" << stats.generated << " rounds=" << stats.rounds
+    if (report) std::cerr << "SPECULATIVE source=" << (external ? "external" : "lookup") << " generated=" << stats.generated << " rounds=" << stats.rounds
               << " proposed=" << stats.proposed << " accepted=" << stats.accepted
               << " replayed=" << stats.replayed << " ms=" << stats.milliseconds
-              << " tok_s=" << std::max(0, stats.generated - 1) * 1000 / stats.milliseconds << '\n';
+              << " tok_s=" << std::max(0, stats.generated - 1) * 1000 / stats.milliseconds
+              << (external ? " verification=batched" : "") << '\n';
+    if (report) std::cerr << "DRAFT_TIMING prepare_ms=" << prepare_ms << " draft_ms=" << draft_ms
+                          << " verify_ms=" << verify_ms << " restore_ms=" << restore_ms << " proposal_calls=" << proposal_calls << '\n';
+    for (int i=0;report&&i<depth;++i)
+        std::cerr << "LOOKUP_POSITION index=" << i << " proposed=" << proposed_at[i]
+                  << " opportunities=" << opportunities[i] << " accepted=" << accepted_at[i] << '\n';
     return stats;
 }
 static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, int max_new,
                                const std::vector<int> &stops, int depth,
                                const std::function<void(int)> &emit,
                                const std::vector<int> *prompt = nullptr) {
+    const auto start = std::chrono::steady_clock::now();
     auto checkpoint = decoder.checkpoint();
     // The first proposal already advanced the draft block with exactly the anchor's resync inputs (the
     // target hidden of the last verified position), so the resync can start after the anchor.
@@ -8868,7 +8950,7 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
     LookupStats stats;
     double draft_ms = 0, verify_ms = 0, resync_ms = 0;
     int lookup_rounds = 0, lookup_proposed = 0, lookup_accepted = 0;
-    std::array<int, 7> mtp_position_proposed{}, mtp_position_accepted{};
+    std::array<int, 7> mtp_position_proposed{}, mtp_position_accepted{}, mtp_position_opportunities{};
     int margin_skipped = 0;
     struct MatchStats { int rounds=0, proposed=0, accepted=0; };
     std::array<MatchStats, 4> match_stats{};
@@ -8876,7 +8958,7 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
         return std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - begin).count();
     };
-    const auto start = std::chrono::steady_clock::now();
+    const double prepare_ms = elapsed_ms(start);
     auto output = [&](int token) {
         emit(token); ++stats.generated;
         if (lookup) lookup->append(token);
@@ -8937,8 +9019,9 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
         verify_ms += elapsed_ms(verify_start);
         ++stats.rounds; stats.proposed += k;
         int accepted = 0;
-        while (accepted < k && window[accepted + 1] ==
-               greedy(all, (size_t)accepted * decoder.vocabulary(), decoder.vocabulary())) {
+        while (accepted < k) {
+            if (accepted < mtp_proposals) ++mtp_position_opportunities[accepted];
+            if (window[accepted + 1] != greedy(all, (size_t)accepted * decoder.vocabulary(), decoder.vocabulary())) break;
             output(window[++accepted]);
             if (stats.stopped) break;
         }
@@ -8984,11 +9067,11 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
               << " proposed=" << stats.proposed << " accepted=" << stats.accepted
               << " replayed=" << stats.replayed << " ms=" << stats.milliseconds
               << " tok_s=" << std::max(0, stats.generated - 1) * 1000 / stats.milliseconds << '\n';
-    std::cerr << "MTP_TIMING draft_ms=" << draft_ms << " verify_ms=" << verify_ms
+    std::cerr << "MTP_TIMING prepare_ms=" << prepare_ms << " draft_ms=" << draft_ms << " verify_ms=" << verify_ms
               << " resync_ms=" << resync_ms << '\n';
     for (size_t i = 0; i < mtp_position_proposed.size(); ++i)
         if (mtp_position_proposed[i]) std::cerr << "MTP_POSITION index=" << i
-            << " proposed=" << mtp_position_proposed[i] << " accepted=" << mtp_position_accepted[i] << '\n';
+            << " proposed=" << mtp_position_proposed[i] << " opportunities=" << mtp_position_opportunities[i] << " accepted=" << mtp_position_accepted[i] << '\n';
     if (continuation_margin > 0.f) std::cerr << "MTP_MARGIN minimum=" << continuation_margin
                                           << " skipped=" << margin_skipped << '\n';
     if (lookup) std::cerr << "MTP_LOOKUP rounds=" << lookup_rounds << " proposed=" << lookup_proposed
@@ -9347,6 +9430,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: strata-glm-decode <shard.gguf> <comma-separated token IDs> [steps=1] "
                      "[dense-cache-MiB=4096] [threads=6] [--prefill-batch=1..8192|auto] "
                      "[--gpu-budget-mib=12288] [--check-prefill] [--check-native-dense] "
+                     "[--speculative=external --draft-worker-config=worker.json --draft-depth=1..7] "
                      "[--gpu-devices=0|0,1] [--prefill-expert-cache-mib=auto|N] [--lock-weights] [--check-gpu-split] "
                      "[--decode-prefill-cache] [--decode-bench=3] [--decode-mode-sweep[=mtp]] [--check-verify-graphs] [--profile-decode] [--profile-prefill] "
                      "[--expert-pack=sidecar.gguf] [--expert-pack-profile=retain.json] [--cpu-expert-backend=auto|native|packed-dot|packed-lut] "
@@ -9397,6 +9481,8 @@ int main(int argc, char **argv) {
         std::string remote_tp_reply = "f16";
         std::string remote_tp_weights = "send";
         std::string dump, dump_prefill, routing_trace_path;
+        std::string external_worker_config;
+        bool external_speculation = false;
         std::vector<int> stops;
         for (int i = 6; i < argc; ++i) {
             const std::string flag = argv[i];
@@ -9442,6 +9528,8 @@ int main(int argc, char **argv) {
                 force_gpu = true;
             } else if (flag == "--decode-experts=cpu")
                 stream_decode = false;
+            else if (flag == "--speculative=external") { external_speculation = true; force_gpu = true; }
+            else if (flag.starts_with("--draft-worker-config=")) external_worker_config = flag.substr(22);
             else if (flag == "--speculative=mtp") { use_mtp = true; force_gpu = true; }
             else if (flag == "--mtp-experts=cpu") mtp_cpu_experts = true;
             else if (flag == "--mtp-experts=gpu") mtp_cpu_experts = false;
@@ -9502,6 +9590,28 @@ int main(int argc, char **argv) {
                 stops = token_ids(flag.substr(11));
             else
                 throw std::invalid_argument("unknown option: " + flag);
+        }
+        std::unique_ptr<strata::spec::ExternalWorker> external_worker;
+        if (external_speculation) {
+            if (external_worker_config.empty() || use_mtp || lookup_depth || decode_mode_sweep ||
+                !eval_corpus.empty() || replay || stream_decode || draft_depth < 1 || draft_depth > 7)
+                throw std::invalid_argument("external drafting requires worker config, depth 1..7 and ordinary single-sequence mode");
+            lookup_depth = draft_depth;
+            setenv("STRATA_GLM_CACHE_LOOKUP", "1", 1);
+            try {
+                const auto prepare_start = std::chrono::steady_clock::now();
+                external_worker = std::make_unique<strata::spec::ExternalWorker>(external_worker_config);
+                external_worker->prime(tokens);
+                if (!external_worker->active()) { external_worker.reset(); lookup_depth = 0; }
+                std::cerr << "EXTERNAL_PREPARE ms=" << std::chrono::duration<double,std::milli>(
+                    std::chrono::steady_clock::now()-prepare_start).count() << '\n';
+            }
+            catch (const std::exception& e) {
+                std::cerr << "EXTERNAL_DRAFT_DISABLED startup=" << e.what() << '\n';
+                lookup_depth = 0;
+            }
+        } else if (!external_worker_config.empty()) {
+            throw std::invalid_argument("draft worker config requires --speculative=external");
         }
         if (decode_mode_sweep) {
             if (use_mtp || lookup_depth || replay || stream_decode || check_prefill || check_verify || check_decode_graphs || check_verify_graphs || check_gpu_split || decode_cache_mib || decode_cache_auto || decode_cache_adapt || decode_prefill_cache || cpu_prepack_mib || expert_mib || std::filesystem::is_directory(argv[1]))
@@ -9744,7 +9854,8 @@ int main(int argc, char **argv) {
         const bool mtp_prepared_for_cache = use_mtp && decoder.prepare_mtp_for_cache(tokens, draft_depth);
         // Own retained rollback history before sizing the tier. Lookup has no draft block,
         // but rejected windows still need the same target-state recovery as MTP.
-        if (lookup_depth && decode_cache_mib && cached_lookup_enabled())
+        if (lookup_depth && decode_cache_mib && cached_lookup_enabled() &&
+            (!external_worker || decoder.external_batch_exact()))
             decoder.enable_verify_history(lookup_depth);
         decoder.probe_decode_cache(logits, stops);
         const auto cache_prepare_start = std::chrono::steady_clock::now();
@@ -9904,7 +10015,7 @@ int main(int argc, char **argv) {
             decoder.restore(checkpoint);
             auto checked_logits = logits;
             auto checked = generate_lookup(decoder, checked_logits, tokens, check_tokens, {}, lookup_depth,
-                                           [&](int token) { actual.push_back(token); }, false);
+                                           [&](int token) { actual.push_back(token); }, false, external_worker.get());
             if (actual != expected) throw std::runtime_error("GLM: cached lookup changed greedy target output");
             decoder.restore(checkpoint);
             std::cerr << "LOOKUP_PARITY tokens=" << check_tokens << " output=identical proposed=" << checked.proposed
@@ -10010,7 +10121,7 @@ int main(int argc, char **argv) {
         } else if (trial_lookup) {
             generate_lookup(decoder, logits, tokens, steps, stops, trial_lookup, [](int token) {
                 std::cout << token << '\n' << std::flush;
-            });
+            }, true, external_worker.get());
         } else {
             const auto decode_start = std::chrono::steady_clock::now();
             int decode_steps = 0;

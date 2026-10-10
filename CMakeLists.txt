@@ -755,7 +755,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                    "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
                    "need python3 with numpy and the repository's vendored gguf-py")
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1
     # bytes, with the flag off as the negative control (synthetic, GPU, no model; the control assumes 32-lane warps)
     add_executable(mmvq_multi_parity src/kernels/mmvq_multi_parity.cpp)

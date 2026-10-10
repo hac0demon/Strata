@@ -20,6 +20,11 @@ class RunConfig:
     draft_block: int = 8               # dflash: verify width per round (block of 7 drafts + anchor), DFlash2 default 8
     draft_acceptance: str = "dflash_code"  # dflash: routing.ACCEPTANCE profile (dflash_chat / dflash_code / dflash_math)
     draft_model_mib: float = 1536      # dflash: drafter weights resident on the GPU (read once per round)
+    external_draft_ms: float = -1.0    # measured worker/retokenization/draft cost per round; -1 = unknown
+    external_sequential: bool = False # required for residency-biased/deferred single-step target arithmetic
+    external_draft_mib: float = 768   # external weights, KV and workspace together; bounded release experiment
+    lookup_draft_ms: float = 0.01      # CPU proposal overhead; replace with measured value when calibrating
+    proposal_probability: float = 1.0 # measured share of lookup/external calls producing a nonempty window
     draft_layers: int = 5              # dflash: drafter depth (launch overhead per forward)
     max_verify_width: int = 8          # engine cap on tokens per step (cpu::MAXT = 8); raise to explore
     expert_skip: float = 0.0           # share of routed expert bytes skipped by gate thresholds (lossy)
@@ -65,6 +70,13 @@ class RunConfig:
     prefill_stream_depth: int = 0      # expert groups in flight beyond the 2-slot ring; >= 18 streams continuously
                                        # across layers (uploads never wait for the GPU; architecture option)
     prefill_gemm_scale: float = 1.0    # relative speed of the MoE GEMM path (what-if for a better kernel)
+    prefill_backend: str = "legacy"   # legacy | mmq | bf16-wmma; calibrated separately
+    routing_profile: str = ""         # identifies a frozen profile, not a quality guarantee
+    routing_affinity_layers: dict = dataclasses.field(default_factory=dict) # frozen per-layer routing overrides
+    pipeline: bool = True
+    decode_graphs: bool = True
+    ordered_kda: bool = False
+    mhc_save_fused: bool = False
     prefill_experts: str = "gpu"       # gpu (stream over PCIe) | cpu (CPU computes the union of experts) | auto
     prefill_cpu_assist: bool = False   # CPU computes experts for part of the chunk while the GPU streams the rest
     batch: int = 1                     # independent sequences decoded per step (<= 8)

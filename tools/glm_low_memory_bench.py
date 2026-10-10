@@ -89,7 +89,11 @@ def parse_log(log):
                 for line in log.splitlines() if line.startswith(tag + " ")]
     return dict(prefill=prefill, decode=decode,
         cpu_expert=records("CPU_EXPERT"), mtp_timing=records("MTP_TIMING"),
-        mtp_positions=records("MTP_POSITION"), step_trace=records("STEP_TRACE"),
+        mtp_positions=records("MTP_POSITION"), lookup_positions=records("LOOKUP_POSITION"),
+        draft_timing=records("DRAFT_TIMING"), external_prepare=records("EXTERNAL_PREPARE"),
+        external_ready=records("EXTERNAL_READY"),
+        external_verification=re.findall(r'SPECULATIVE source=external .*verification=(\w+)',log),
+        step_trace=records("STEP_TRACE"),
         decode_cache=records("DECODE_CACHE"), speculation=records("SPECULATIVE"),
         affinity_quality=records("AFFINITY_QUALITY"), lookup_parity=records("LOOKUP_PARITY"),
         median_prefill_tok_s=statistics.median(r["tokens_per_second"] for r in prefill) if prefill else None,
@@ -100,6 +104,24 @@ def parse_log(log):
                   for d, tags in re.findall(r"GPU_LIVE device=(\d+) (.*)", log)],
         page_faults=[dict(trial=int(i), major=int(a), minor=int(b)) for i, a, b in re.findall(
             r"FAULTS trial=(\d+) major=(\d+) minor=(\d+)", log)])
+
+
+def decode_complete(ids, rows, maximum, trials, stops=()):
+    """Validate each EOS-aware output against its own timing record."""
+    if len(rows) != trials:
+        return False
+    cursor = 0
+    for row in rows:
+        count = row['tokens'] + (row['kind'] == 'single')
+        tokens = ids[cursor:cursor+count]
+        if not 1 <= count <= maximum or len(tokens) != count:
+            return False
+        if any(t in stops for t in tokens[:-1]):
+            return False
+        if count < maximum and tokens[-1] not in stops:
+            return False
+        cursor += count
+    return cursor == len(ids)
 
 
 def group_stats(group):
@@ -179,7 +201,17 @@ def hip_gpu_device(config):
     return devices[0].resolve()
 
 
-def hip_gpu_snapshot(device):
+def validate_hip_link(device):
+    # sysfs vendor/memory attributes can retain cached values after bus loss.
+    # Reading the PCI ID avoids issuing an SMU clock/metrics request.
+    with (device / 'config').open('rb') as stream:
+        identity=stream.read(4)
+    if len(identity)!=4 or int.from_bytes(identity[:2],'little')!=0x1002:
+        raise ValueError('AMD GPU PCI configuration is inaccessible; do not launch')
+
+
+def hip_gpu_snapshot(device, telemetry=True, require_pci=False):
+    if require_pci:validate_hip_link(device)
     total = int((device / "mem_info_vram_total").read_text())
     used = int((device / "mem_info_vram_used").read_text())
     if total <= 0 or used < 0 or used > total:
@@ -192,15 +224,16 @@ def hip_gpu_snapshot(device):
         result["gtt_used_mib"] = (int(gtt.read_text())+mib-1) // mib
     # Optional evidence for interpreting timings; missing clock attributes do
     # not weaken or disable the VRAM guard.
-    telemetry = {}
-    for name in ("power_dpm_force_performance_level", "pp_dpm_sclk", "pp_dpm_mclk",
-                 "gpu_busy_percent", "mem_busy_percent"):
+    performance = {}
+    for name in (("power_dpm_force_performance_level", "pp_dpm_sclk", "pp_dpm_mclk",
+                 "gpu_busy_percent", "mem_busy_percent")
+                 if telemetry else ()):
         try:
-            telemetry[name] = (device / name).read_text().strip()
+            performance[name] = (device / name).read_text().strip()
         except OSError:
             pass
-    if telemetry:
-        result["performance"] = telemetry
+    if performance:
+        result["performance"] = performance
     return result
 
 
@@ -208,7 +241,8 @@ def read_gpu(config, pid=None):
     if config.get("backend", "cuda") == "hip":
         # Global VRAM includes the engine, driver and every other GPU client.
         # sysfs cannot attribute it to this PID, so do not invent a process value.
-        return None, hip_gpu_snapshot(hip_gpu_device(config))
+        return None, hip_gpu_snapshot(hip_gpu_device(config),config.get('gpu_telemetry',True),
+                                      config.get('gpu_pci_preflight',False))
     if config.get("backend", "cuda") != "cuda":
         raise ValueError("unsupported GPU backend for the memory guard")
     snapshot = gpu_snapshot(subprocess.check_output(["nvidia-smi", "--id=0",
@@ -272,10 +306,16 @@ def worker(args):
         command.append("--dump-prefill-logits=" + str(args.output.with_suffix(".prefill.logits.bin").resolve()))
     if cfg.get("expert_pack"):
         command.append("--expert-pack=" + cfg["expert_pack"])
+    if cfg.get("stop_ids"):
+        if not all(type(t) is int and t >= 0 for t in cfg['stop_ids']):
+            raise ValueError('stop_ids must contain nonnegative integer token IDs')
+        command.append('--stop-ids=' + ','.join(map(str, cfg['stop_ids'])))
     if cfg.get("decode_graphs"):
         command.append("--decode-graphs")
     if cfg.get("decode_cache_mib"):
         command.append("--decode-cache-mib=" + str(cfg["decode_cache_mib"]))
+    if cfg.get('decode_cache_slots'):
+        command.append('--decode-cache-slots='+str(cfg['decode_cache_slots']))
     if "decode_cache_window" in cfg:
         command.append("--decode-cache-window=" + str(cfg["decode_cache_window"]))
     for name in cfg.get("decode_checks", []):
@@ -286,11 +326,15 @@ def worker(args):
         command += ["--speculative=mtp", "--mtp-experts=cpu", "--draft-depth=" + str(cfg.get("draft_depth", 2))]
     if not args.single and not args.eval_corpus and cfg.get("speculative") == "lookup":
         command += ["--speculative=lookup", "--lookup-depth=" + str(cfg.get("lookup_depth", 3))]
+    if not args.single and not args.eval_corpus and cfg.get("speculative") == "external":
+        command += ["--speculative=external", "--draft-depth=" + str(cfg.get("draft_depth", 2)),
+                    "--draft-worker-config=" + str(Path(cfg["draft_worker_config"]).resolve())]
     group = Path("/sys/fs/cgroup" + Path("/proc/self/cgroup").read_text().strip().split(":")[-1])
     before = group_stats(group)
     if before["memory.max"] != args.ram_gib * 2**30 or before["memory.swap.max"] != 0:
         raise RuntimeError("effective cgroup limits do not match the requested benchmark")
     record = dict(started_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        prompt_sha256=hashlib.sha256(args.prompt.read_bytes()).hexdigest(),
         config=cfg, command=command, memory_limit_gib=args.ram_gib, swap_limit_bytes=0,
         fit_only=args.fit_only,
         cgroup=str(group), cgroup_before=before, interference=[], samples=[])
@@ -425,8 +469,8 @@ def worker(args):
         ids = list(map(int, output.split()))
         record["output_token_count"] = len(ids)
         complete = (len(record["measurements"]["prefill"]) == args.trials and
-                    len(record["measurements"]["decode"]) == args.trials and
-                    len(ids) == args.tokens * args.trials)
+                    decode_complete(ids, record['measurements']['decode'], args.tokens,
+                                    args.trials, cfg.get('stop_ids', [])))
     record["complete"] = complete
     record["clean"] = not (args.fit_only or code or rejection or record["interference"] or
         record["cgroup_after"]["memory.events"].get("oom_kill", 0)) and complete

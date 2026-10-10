@@ -57,7 +57,10 @@ def _mixer_ms(hw, cfg, params, layer, tokens, position=0):
 def _gemm_ms(hw, cfg, params, tokens, groups):
     # the MoE GEMMs are compute-bound: scale with tensor throughput
     scale = REFERENCE_GPU["tflops"] / max(1.0, hw.gpu.tflops)
-    us = params.prefill_gemm_us * (params.prefill_legacy_gemm if cfg.prefill_legacy else 1.0) / max(0.05, cfg.prefill_gemm_scale)
+    if cfg.prefill_backend not in ("legacy", "mmq", "bf16-wmma"):
+        raise ValueError("unsupported prefill backend: " + cfg.prefill_backend)
+    gemm_us = params.prefill_wmma_gemm_us if cfg.prefill_backend == "bf16-wmma" else params.prefill_gemm_us
+    us = gemm_us * (params.prefill_legacy_gemm if cfg.prefill_legacy else 1.0) / max(0.05, cfg.prefill_gemm_scale)
     return tokens * us * 1e-3 * scale + groups * params.prefill_group_fixed_ms
 
 
