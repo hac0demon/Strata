@@ -1,5 +1,6 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/host/glm_env.h"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
 #include "strata/core/on_device.hpp"
@@ -57,10 +58,7 @@ constexpr float EPS = 1e-6f;
 
 // #783 PR-i: STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
 bool mtp_catchup_all() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
+    static const bool on = strata_env_truthy_nonempty("STRATA_MTP_CATCHUP_ALL");
     return on;
 }
 constexpr int GGML_Q8_0 = 8;
@@ -418,7 +416,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // on stage 0 waits for it, so its stream gets the highest priority there (STRATA_MTP_PRIORITY=0: the default)
     bool prio = false;
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)   // (HIP: the default priority)
-    static const bool hi_prio = [] { const char* v = std::getenv("STRATA_MTP_PRIORITY"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool hi_prio = strata_env_truthy_number_default("STRATA_MTP_PRIORITY", 1);
     int prio_lo = 0, prio_hi = 0;
     if (force_on_ && hi_prio && cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi) == cudaSuccess)
         prio = cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, prio_hi) == cudaSuccess;
@@ -452,13 +450,13 @@ namespace {
 // STRATA_MTP_FULL_HEAD=1 (a diagnostic): draft over the whole vocabulary (the main head itself) instead of
 // rt/draft_vocab.bin's subset - the reference head, to measure what the subset costs in acceptance
 bool full_head_env() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_FULL_HEAD"); return v && v[0] == '1'; }();
+    static const bool on = strata_env_truthy_one("STRATA_MTP_FULL_HEAD");
     return on;
 }
 }  // namespace
 
 bool MtpDrafter::top2_env() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TOP2"); return v && v[0] == '1'; }();
+    static const bool on = strata_env_truthy_one("STRATA_MTP_TOP2");
     return on;
 }
 
@@ -728,10 +726,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         // #783 PR-d (stuchapin909): the T tokens' K norm, K/V rotation and K/V append each run once over all T rows
         // (every row is independent; the rope keeps its per-token positions). STRATA_NO_BATCH_KV_STEP=1 appends per token.
-        static const bool no_batch_kv = [] {
-            const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        static const bool no_batch_kv = strata_env_truthy_nonempty("STRATA_NO_BATCH_KV_STEP");
         // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope fused (bit-identical to the pair, rope_parity
         // check 6; STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes). K rows of one token
         // are consecutive in `pos`, tokens are NH apart, so a one-token window is the fusable case.
@@ -846,16 +841,12 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         nsw.q8_1 = xq_;   // the routed experts read hit_xq_
         const SForm none{};
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
-        static const bool fuse_head_gr = [] {
-            const char* v = std::getenv("STRATA_FUSE_HEAD_GR");
-            return v != nullptr && std::atoi(v) != 0;
-        }();
+        static const bool fuse_head_gr = strata_env_truthy_number("STRATA_FUSE_HEAD_GR");
         static const bool head_mix_multi_on = [] {
 #if defined(STRATA_USE_HIP)
             return false;
 #else
-            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
-            return v == nullptr || std::atoi(v) != 0;
+            return strata_env_truthy_number_default("STRATA_HEAD_MIX_MULTI", 1);
 #endif
         }();
         // the shared expert only reads mixed_ / xq_ and writes shared_: a branch beside the router and the routed
@@ -864,8 +855,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 #if defined(STRATA_USE_HIP)
             return false;
 #else
-            const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
-            return v == nullptr || std::atoi(v) != 0;
+            return strata_env_truthy_number_default("STRATA_MTP_SHARED_BRANCH", 1);
 #endif
         }();
         cudaStream_t sh_cs = cs;
@@ -910,10 +900,8 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         } else {
             shared_rows();
         }
-        static const bool no_multi_gr = [] {   // #783 PR-g: STRATA_NO_MULTI_GR=1 keeps the per-token GR calls
-            const char* v = std::getenv("STRATA_NO_MULTI_GR");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        static const bool no_multi_gr =   // #783 PR-g: STRATA_NO_MULTI_GR=1 keeps the per-token GR calls
+            strata_env_truthy_nonempty("STRATA_NO_MULTI_GR");
         for (int t = 0; t < T; ++t) {
             if (!(T > 1 && native_moe_combine_enabled())) {
                 if (native_moe_combine_enabled())
@@ -1151,14 +1139,11 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // in hipGraphLaunch or the final sync until the watchdog ends the engine.  R9700, full IQ3_XXS, --kv-resident
     // 32768, mixed load (chats, 32K and 7K prompts, deep follow-ups): E-4 hung in the first round on 2 of 2 tries,
     // the old loop ran 30 of 30 rounds clean, prompt speed unchanged.
-    static const bool per_group_sync = [] {
-        if (const char* v = std::getenv("STRATA_MTP_PREFILL_SYNC")) return std::atoi(v) != 0;
 #if defined(STRATA_USE_HIP)
-        return true;
+    const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 1);
 #else
-        return false;
+    const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 0);
 #endif
-    }();
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {
         if (pf_cap_ < n * per_row) {

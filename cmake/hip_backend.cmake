@@ -55,6 +55,51 @@ foreach(_cfg IN ITEMS DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
         "Flags used by the HIP compiler during ${_cfg} builds." FORCE)
   endif()
 endforeach()
+# ROCm's CMake packages sit in <rocm>/lib/cmake/hip, and <rocm> is not always /opt/rocm.  A distro package
+# installs there; a toolkit unpacks to a versioned directory (/opt/rocm/core-10.0, which has the packages and
+# /opt/rocm does not); ROCM_PATH / HIP_PATH may point somewhere else again; and on Windows ROCm's own tooling
+# passes the HIP compiler path.  find_package searches CMAKE_PREFIX_PATH, so derive it here instead of making
+# every caller (and setup.py's batch of -D flags) remember to pass one: a HIP configure that cannot find its
+# packages otherwise stops at "Could not find a package configuration file provided by hip" with no hint where
+# to point it.
+set(_strata_hip_roots "$ENV{ROCM_PATH}" "$ENV{HIP_PATH}" "$ENV{ROCM_HOME}" "/opt/rocm")
+file(GLOB _strata_rocm_cores LIST_DIRECTORIES true "/opt/rocm/core-*")
+if(_strata_rocm_cores)
+  list(SORT _strata_rocm_cores ORDER DESCENDING)
+  list(APPEND _strata_hip_roots ${_strata_rocm_cores})
+endif()
+# .../lib/llvm/bin/clang++ and .../bin/clang++.rocm both have the packages an ancestor directory up: the first
+# ancestor that has them wins, so a tree with several ROCm installs does not add all of them.
+if(DEFINED CMAKE_HIP_COMPILER AND NOT "${CMAKE_HIP_COMPILER}" STREQUAL "")
+  set(_strata_hip_dir "${CMAKE_HIP_COMPILER}")
+  foreach(_strata_up "" "/.." "/../.." "/../../.." "/../../../..")
+    get_filename_component(_strata_hip_dir "${_strata_hip_dir}" DIRECTORY   ABSOLUTE)   # no-op on the first pass
+    if(EXISTS "${_strata_hip_dir}${_strata_up}/lib/cmake/hip")
+      list(APPEND _strata_hip_roots "${_strata_hip_dir}${_strata_up}")
+      break()
+    endif()
+  endforeach()
+endif()
+set(_strata_rocm_found "")
+foreach(_strata_root IN LISTS _strata_hip_roots)
+  if("${_strata_root}" STREQUAL "")
+    continue()
+  endif()
+  if(EXISTS "${_strata_root}/lib/cmake/hip")
+    list(APPEND _strata_rocm_found "${_strata_root}")
+  endif()
+endforeach()
+if(_strata_rocm_found)
+  list(REMOVE_DUPLICATES _strata_rocm_found)
+  list(APPEND CMAKE_PREFIX_PATH ${_strata_rocm_found})
+  list(REMOVE_DUPLICATES CMAKE_PREFIX_PATH)
+  message(STATUS "Strata HIP: ROCm prefix ${_strata_rocm_found}")
+else()
+  message(WARNING
+    "Strata HIP: no ROCm install found next to the HIP compiler; pass -DCMAKE_PREFIX_PATH=<rocm> (the directory "
+    "holding lib/cmake/hip) if the packages are elsewhere")
+endif()
+
 find_package(hip CONFIG REQUIRED)
 find_package(hipblas CONFIG REQUIRED)
 # Older distro hipBLAS has no workspace API. The compatibility shim uses

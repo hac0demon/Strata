@@ -1,5 +1,6 @@
 // src/core/arch_defaults.cpp - see include/strata/core/arch_defaults.hpp.
 #include "strata/core/arch_defaults.hpp"
+#include "strata/host/glm_env.h"
 
 #include "strata/kernels/gfx_arch.hpp"
 
@@ -12,8 +13,7 @@ namespace strata::core {
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch) {
     std::vector<std::pair<std::string, std::string>> t;
     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;
-    const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
-    if (off != nullptr && off[0] == '0') return t;
+    if (!strata_env_truthy_default("STRATA_GFX1151_DEFAULTS", 1)) return t;
     // Exact (bitwise) on Aurora, each with its measured gain in aurora_s23.md:
     t = {
         // prompt
@@ -43,7 +43,7 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
 std::vector<std::string> apply_arch_defaults(const char* gcn_arch) {
     std::vector<std::string> set;
     for (const auto& kv : arch_default_env(gcn_arch)) {
-        if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
+        if (strata_env_is_set(kv.first.c_str())) continue;   // the user's setting wins, whatever it is
 #if defined(_WIN32)
         _putenv_s(kv.first.c_str(), kv.second.c_str());
 #else

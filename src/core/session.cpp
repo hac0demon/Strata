@@ -1,5 +1,6 @@
 // src/core/session.cpp - one token through all 48 layers.  See the header for why the graphs are per-layer.
 #include "strata/core/session.hpp"
+#include "strata/host/glm_env.h"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/progress.hpp"
 
@@ -919,8 +920,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     if (le != cudaSuccess) { err = std::string("session_run_token: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs);                     // one flush, so WDDM submits the graph now
     static const int flush_us = [] {
-        const char* e = std::getenv("STRATA_TG_FLUSH_US");
-        return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
+        return (int) strata_env_value_ll("STRATA_TG_FLUSH_US", 2000);   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
     }();
     volatile uint32_t* const seq = s.db->h_seq;
     volatile uint32_t* const flag = s.db->h_flag;

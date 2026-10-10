@@ -1,6 +1,8 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
+#include "strata/host/glm_env.h"
+#include "strata/host/glm_names.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -428,8 +430,8 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 #elif defined(__linux__)
     (void) paths;
     if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0') {
-        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
-        return env[0] != '0';
+        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;   // the message shows what was set
+        return strata_env_truthy_nonempty("STRATA_UNBUFFERED_LOAD");
     }
     uint64_t avail = 0;
     if (!available_memory_bytes(avail)) {
@@ -579,10 +581,9 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
-    if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::atoi(v) != 0;
+    io_ahead_ = strata_env_truthy_number("STRATA_IO_PF_AHEAD");
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping (STRATA_IO_PF_STAGE=1: stage)
-        const char* v = std::getenv("STRATA_IO_PF_STAGE");
-        io_fill_ = role_ptr_.empty() && !(v != nullptr && std::atoi(v) != 0);
+        io_fill_ = role_ptr_.empty() && !strata_env_truthy_number("STRATA_IO_PF_STAGE");
     }
     io_pf_ = true;
     io_stats_ = true;
@@ -1193,6 +1194,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         // STRATA_STAGE_PIN: 0 keeps them pageable (as before 0.1.41), 1 always tries to pin, unset (the default) pins while
         // the host has kStagePinFloor of RAM to spare beside this buffer (the pool grows to ~257 buffers, 0.4-0.6 GiB):
         // a low-RAM box keeps pageable ones instead of paying for the pinning (recommend, never force).
+        // Three-valued (unset = auto), so this one is not a switch: it reads a number and keeps the "was it set" bit.
+        // Three answers (unset / on / off), so a switch does not fit: this one keeps its own read.
         static const int pin_mode = [] { const char* v = std::getenv("STRATA_STAGE_PIN"); return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0); }();
         bool want_pin = pin_mode != 0;
         if (pin_mode < 0) {
@@ -1421,8 +1424,7 @@ void FileExpertSource::fill_many(const std::vector<Fill>& todo) {
     {
         using Pvm = BOOL(WINAPI*)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
         static const Pvm pvm = [] {
-            const char* v = std::getenv("STRATA_FETCH_PVM");
-            if (v != nullptr && std::atoi(v) == 0) return (Pvm) nullptr;
+            if (strata_env_truthy_number("STRATA_FETCH_PVM") == 0 && strata_env_is_set("STRATA_FETCH_PVM")) return (Pvm) nullptr;
             return (Pvm) (void*) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
         }();
         if (pvm != nullptr) {
@@ -1524,7 +1526,7 @@ bool FileExpertSource::set_unbuffered(uint64_t ram_bytes, std::string& why) {
 bool FileExpertSource::recheck_unbuffered(std::string& why) {
 #if defined(_WIN32) || defined(__linux__)
     if (const char* env = std::getenv("STRATA_UNBUFFERED_LOAD"); env != nullptr && env[0] != '\0') {
-        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;
+        why = std::string("STRATA_UNBUFFERED_LOAD=") + env;   // the message shows what was set
         return !direct_.empty();
     }
     if (base_ == nullptr || paths_.empty()) {
@@ -2130,8 +2132,7 @@ const uint8_t* FileExpertSource::mapped_blob(int64_t layer, int64_t expert) cons
 uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #if defined(_WIN32)
     static const bool enabled = [] {
-        const char* v = std::getenv("STRATA_FILE_RELEASE");
-        return v != nullptr && std::strcmp(v, "1") == 0;
+        return strata_env_is_one("STRATA_FILE_RELEASE");
     }();
     if (!enabled || base_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
         return 0;
@@ -2374,15 +2375,13 @@ bool FileExpertSource::pin_cache_complement(
         // STRATA_PIN_GUARD=0 pages-locks in one go as before, =2 always registers in steps (a test); STRATA_PIN_RESERVE_GIB
         // is the RAM that must stay above every step (default: the resident headroom, at least 2 GiB)
         const uint64_t pace_reserve = [&] {
-            const char* v = std::getenv("STRATA_PIN_RESERVE_GIB");
-            return v != nullptr && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0)
-                                                     : std::max<uint64_t>(headroom_bytes, 2ull << 30);
+            const double gib = strata_env_value_double("STRATA_PIN_RESERVE_GIB", 0.0);
+            return gib > 0 ? (uint64_t) (gib * 1073741824.0) : std::max<uint64_t>(headroom_bytes, 2ull << 30);
         }();
 #if defined(__linux__)
         if (pin) {
             static const int guard = [] {
-                const char* v = std::getenv("STRATA_PIN_GUARD");
-                return v == nullptr ? 1 : std::atoi(v);
+                return (int) strata_env_value_ll("STRATA_PIN_GUARD", 1);
             }();
             uint64_t free_now = 0;
             if (guard == 2) {
@@ -2462,14 +2461,13 @@ bool FileExpertSource::pin_cache_complement(
                 // faster than the CPU computing them (7.30 / 7.44 tok/s with 24 / 16 GiB registered against 7.05-7.74
                 // unpinned at a 40 GiB budget), and registering adds startup time and driver memory pressure
                 static const bool partial_on = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN");
-                    return v != nullptr && std::atoi(v) != 0;
+                    return strata_env_truthy_number("STRATA_PARTIAL_PIN");
                 }();
                 // at most STRATA_PARTIAL_PIN_GIB (default 24): registering 30 GiB of a 40 GiB arena left the driver
                 // unable to page-lock the prompt path's small buffers afterwards (RTX 5070, WDDM)
                 static const uint64_t pin_cap = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN_GIB");
-                    return (uint64_t) ((v != nullptr && std::atof(v) > 0 ? std::atof(v) : 24.0) * 1073741824.0);
+                    const double gib = strata_env_value_double("STRATA_PARTIAL_PIN_GIB", 24.0);
+                    return (uint64_t) ((gib > 0 ? gib : 24.0) * 1073741824.0);
                 }();
                 if (paced) {
                     // #1250: the pages are taken in 1 GiB steps by ordinary page faults (which reclaim file cache as
@@ -2762,8 +2760,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     if ((uint64_t)n > std::numeric_limits<size_t>::max() / blob) {
         err = "FileExpertSource: exchange allocation size overflow"; return false;
     }
-    const char* rotate_env = std::getenv("STRATA_EXCHANGE_ROTATE");
-    const bool requested = rotate_env && std::strcmp(rotate_env, "1") == 0;
+    const bool requested = strata_env_is_one("STRATA_EXCHANGE_ROTATE");
     const bool uniform = std::all_of(layer_blob_bytes_.begin(), layer_blob_bytes_.end(),
                                     [blob](uint64_t b) { return b == blob; });
     const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
@@ -3125,7 +3122,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
-    static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
+    static const bool ptrace = strata_env_is_set("STRATA_POOL_TRACE");
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -3264,10 +3261,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             for (int64_t i = 0; i < n; ++i) if (d.remote[r]->owns(i)) kind[i] = 2;
         }
     }
-    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    static const bool dec_batch = strata_env_truthy_number_default("STRATA_DEC_BATCH", 1);
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
-    static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool device_plan = strata_env_truthy_number("STRATA_VERIFY_DEVICE_PLAN");
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
@@ -3616,7 +3613,8 @@ void ExpertSource::record_inputs(const std::string& pack_experts, const std::str
     // the same resolution open_gguf / load_experts_gguf use: every (layer, role) tensor and the file it is read from
     for (int64_t l = 0; l < lay.n_layers; ++l)
         for (int r = 0; r < 3; ++r)
-            inputs_.push_back({"expert blk." + std::to_string(l) + ".ffn_" + roles[r], expert_gguf_file(gguf, lay, l, r)});
+            inputs_.push_back({"expert " + strata::host::blk_name(static_cast<int>(l), "ffn_") + roles[r],
+                                expert_gguf_file(gguf, lay, l, r)});
 }
 
 bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::ExpertLayout& lay, std::string& err) {
@@ -3635,7 +3633,8 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
                 const std::string path = expert_gguf_file(gguf, lay, l, r);
                 auto& f = files[path];
                 if (!f) f = std::make_unique<strata::GgufFile>(path);
-                const std::string name = "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight";
+                const std::string suffix = std::string("ffn_") + roles[r] + "_exps.weight";
+                const std::string name = strata::host::blk_name(static_cast<int>(l), suffix.c_str());
                 const strata::TensorInfo* t = f->find(name);
                 const uint64_t want_type = (uint64_t) (r < 2 ? fm.gu_type : fm.d_type);
                 // GGUF order: dim 0 is the row (the input), dim 1 the rows, dim 2 the experts
@@ -3892,7 +3891,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #if defined(_WIN32)
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
-    static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+    static const bool arena_mmap = strata_env_truthy_one("STRATA_ARENA_MMAP");
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
@@ -3974,9 +3973,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // arena registered per layer before it is filled decoded ~10% slower than the old order (whole-arena try, sliced
     // fallback after the load) with identical output; the start-time gain does not pay for that.
 #ifdef _WIN32
-    const char* defer_env = std::getenv("STRATA_DEFERRED_REGISTER");
     const bool deferred = max_pinned_bytes == 0 && arena_pin_cap_gib() == -1 && shared_arena_file.empty() &&
-                          (defer_env != nullptr && defer_env[0] != 0 && defer_env[0] != '0');
+                          strata_env_truthy_nonempty("STRATA_DEFERRED_REGISTER");
 #else
     const bool deferred = false;
 #endif
@@ -4038,7 +4036,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
-    if (std::getenv("STRATA_VERIFY_ARENA") != nullptr) {   // tests: the loaded arena's checksum, any loader
+    if (strata_env_is_set("STRATA_VERIFY_ARENA")) {   // tests: the loaded arena's checksum, any loader
         std::fprintf(stderr, "strata generate: expert arena checksum %016llx (%.2f GiB)\n",
                      (unsigned long long) fnv1a64(a->data(), want), (double) want / (1ull << 30));
     }
@@ -4391,16 +4389,15 @@ std::string ForesightSwap::report() const {
 
 ForesightSwap* foresight_swap_from_env(int64_t layers, int64_t experts, const std::vector<int>& card_of_layer,
                                        const std::vector<int>& devices) {
-    const char* v = std::getenv("STRATA_FS_SLOTS");
-    const int slots = v ? std::atoi(v) : 0;
+    const int slots = (int) strata_env_value_ll("STRATA_FS_SLOTS", 0);
     if (slots <= 0) return nullptr;
-    if (const char* dp = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); dp && std::atoi(dp) != 0) {
+    if (strata_env_truthy_number("STRATA_VERIFY_DEVICE_PLAN")) {
         std::fprintf(stderr, "strata serve: foresight swap: off beside STRATA_VERIFY_DEVICE_PLAN (the device would plan "
                              "resident layers without the host)\n");
         return nullptr;
     }
     auto* f = new ForesightSwap();
-    auto env_int = [](const char* name, int def, int lo) { const char* e = std::getenv(name); const int x = e ? std::atoi(e) : def; return x < lo ? lo : x; };
+    auto env_int = [](const char* name, int def, int lo) { const int x = (int) strata_env_value_ll(name, def); return x < lo ? lo : x; };
     f->budget = env_int("STRATA_FS_BUDGET", 32, 1);
     f->admit = env_int("STRATA_FS_ADMIT", 1, 1);
     f->depth = env_int("STRATA_FS_DEPTH", 4, 2);

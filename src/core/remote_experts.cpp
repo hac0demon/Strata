@@ -1,4 +1,5 @@
 #include "strata/core/remote_experts.hpp"
+#include "strata/host/glm_env.h"
 #include "strata/core/remote_expert_opt.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -75,8 +76,8 @@ bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
     // costs more than a small expert batch takes (measured: ~0.3 ms per round trip on Windows).  Only possible
     // before the device's context exists, so first thing; STRATA_REMOTE_SPIN=0 keeps the driver's default.
 #if !defined(STRATA_USE_HIP)
-    const char* spin = std::getenv("STRATA_REMOTE_SPIN");
-    if (!(spin && spin[0] == '0')) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
+    const bool spin_off = !strata_env_truthy_default("STRATA_REMOTE_SPIN", 1);
+    if (!spin_off) cudaInitDevice(device, cudaDeviceScheduleSpin | cudaDeviceMapHost, 0);
     cudaGetLastError();
 #endif
     // HIP has no cudaInitDevice equivalent; retain its default scheduling policy.
@@ -206,8 +207,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     if (!allocated) { close(); return false; }
     // Zero-copy: the helper reads its input from, and writes its compact rows into, the pinned host buffers
     // directly - two copies fewer per layer, each of which is a PCIe round trip.  STRATA_REMOTE_ZEROCOPY=0 copies.
-    const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
-    zero_copy_ = !(zc && zc[0] == '0') &&
+    zero_copy_ = strata_env_truthy_default("STRATA_REMOTE_ZEROCOPY", 1) &&
                  cudaHostGetDevicePointer((void**) &z_x_, h_x_, 0) == cudaSuccess &&
                  cudaHostGetDevicePointer((void**) &z_out_, h_out_, 0) == cudaSuccess;
     cudaGetLastError();
