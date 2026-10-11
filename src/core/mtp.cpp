@@ -1139,10 +1139,11 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // in hipGraphLaunch or the final sync until the watchdog ends the engine.  R9700, full IQ3_XXS, --kv-resident
     // 32768, mixed load (chats, 32K and 7K prompts, deep follow-ups): E-4 hung in the first round on 2 of 2 tries,
     // the old loop ran 30 of 30 rounds clean, prompt speed unchanged.
+    // Read once, as before the C11 migration.
 #if defined(STRATA_USE_HIP)
-    const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 1);
+    static const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 1);
 #else
-    const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 0);
+    static const bool per_group_sync = strata_env_truthy_number_default("STRATA_MTP_PREFILL_SYNC", 0);
 #endif
     const int64_t NHp = g_->n_head, per_row = 1 + 4 + NHp;
     if (!per_group_sync && n > 0) {

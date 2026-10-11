@@ -111,7 +111,8 @@ static int load_one(entry *e, char *err, size_t cap) {
         return STRATA_ENV_OK;
     case STRATA_ENV_TEXT:
         if (copy_text(e, value) == NULL) {
-            (void)snprintf(err, cap, "%s is longer than %d bytes", e->knob.name, STRATA_ENV_TEXT_MAX);
+            if (err != NULL && cap != 0)
+                (void)snprintf(err, cap, "%s is longer than %d bytes", e->knob.name, STRATA_ENV_TEXT_MAX);
             return STRATA_ENV_ERR_TEXT;
         }
         return STRATA_ENV_OK;

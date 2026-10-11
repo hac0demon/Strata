@@ -112,6 +112,7 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
+  target_link_libraries(conversation_file_test PRIVATE strata_host)   # conversation_file.cpp reads its switch via strata_env_*
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
 endif()
 
@@ -232,7 +233,8 @@ endif()
 # duplicate-symbol or missing-declaration bug into code that is already validated against the real artifact.
 add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(strata_artifact INTERFACE strata_warnings)
+# strata_host: model.hpp and other artifact headers call the C11 host rules (names, switches, assembled pack) inline
+target_link_libraries(strata_artifact INTERFACE strata_warnings strata_host)
 
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact strata_host)
@@ -1360,7 +1362,8 @@ if(STRATA_NATIVE_EXPERTS)
     if(MSVC)
       target_compile_options(strata_mmq PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
     endif()
-    target_link_libraries(strata_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    # strata_host: ggml_cuda_host.cu includes strata/core/emulate.hpp, which reads its switches through strata_env_*
+    target_link_libraries(strata_mmq PUBLIC ggml-base strata_host ${_strata_gpu_runtime_target})
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()
@@ -1437,7 +1440,8 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_ORCA_Q4KS_MMQ)
       target_compile_definitions(strata_mmq PRIVATE STRATA_ORCA_Q4KS_MMQ=1)
     endif()
-    target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
+    # strata_host: ggml_cuda_host.cu includes strata/core/emulate.hpp, which reads its switches through strata_env_*
+    target_link_libraries(strata_mmq PUBLIC ggml-base strata_host hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)

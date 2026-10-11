@@ -581,7 +581,7 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
-    io_ahead_ = strata_env_truthy_number("STRATA_IO_PF_AHEAD");
+    io_ahead_ = strata_env_truthy_number_default("STRATA_IO_PF_AHEAD", 1);   // unset keeps read-ahead on (member default)
     {   // experts.bin: fill the page cache from the workers and let the kernels read the mapping (STRATA_IO_PF_STAGE=1: stage)
         io_fill_ = role_ptr_.empty() && !strata_env_truthy_number("STRATA_IO_PF_STAGE");
     }
