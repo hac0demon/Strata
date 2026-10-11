@@ -1230,3 +1230,22 @@ per MTP token. Scripts: `build-spec/adaptive_bound.py`, `build-spec/suffix_repla
 
   Lookup acceptance: edit-cpp 92%, edit-py about 53-62%, review about 41%. Earlier versions show why each rule
   matters: pessimistic priors (0.3-0.7) took no lookup at all (edit-cpp 31.2); without the 24+ rule, +10-15%.
+
+  Ported to the main decoder (`src/program/glm_decode.cpp`, opt-in, exact acceptance only). Screen on TR16
+  (2026-10-12, machine quiet; `configs/glm53f-q2-v3.json`: assembled Q23, MTP depth 3, lookup depth 7 with
+  minimum match 4, GPU budget 13824 MiB, 512 tokens x 3, medians):
+
+  | Prompt | MTP only | Any match replaces MTP | Cost policy, research-build costs | Cost policy, this setup's costs |
+  |---|---:|---:|---:|---:|
+  | edit-cpp | 20.1 | 21.5 (+7%) | 20.8 (+3.5%) | 20.9 (+4%) |
+  | edit-py | 22.6 | 19.9 (−12%) | 21.4 (−5%) | 22.1 (−2%) |
+  | 8K held-out code review | 14.7 | 14.3 (−3%) | 15.3 | 15.3 |
+
+  On the review prompt the policy took no lookup round and ran the same rounds as MTP only; the 14.7 vs 15.3
+  difference is run-to-run drift, not the policy. The cost-policy output matched MTP only token for token on
+  all three prompts; the replace rule's output differed on the review prompt. On this configuration verify
+  time grows about 31 ms per window token (4-token windows 147-149 ms, 7-token lookup windows 239-255 ms,
+  derived from the replace runs), twice the research build's slope, so lookup windows gain less here. The
+  shipped starting costs are these measurements; the research-build costs (4 wide 102 ms, about 15 ms per
+  token) made the policy take losing lookup rounds on edit-py. One edit-py cost run was stopped by the GPU
+  memory reserve guard (483 MiB free of the 512 MiB reserve at a 13824 MiB budget) and was repeated.

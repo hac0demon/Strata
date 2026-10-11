@@ -8860,6 +8860,28 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
         lookup = std::make_unique<strata::spec::SuffixDrafter>(minimum_match, 32, prompt->size() + max_new);
         lookup->append(prompt->data(), prompt->size());
     }
+    // STRATA_GLM_MTP_LOOKUP_POLICY=cost: a lookup (suffix) draft replaces the MTP draft only when its expected
+    // tokens per millisecond is higher, and is cut to the length that maximizes it. Lookup acceptance per token is
+    // learned per match-length bucket; verify time per window width and MTP's tokens and time per round are
+    // running averages. The default ("replace") takes every lookup draft of 2+ tokens, as before.
+    static const bool cost_policy = [] {
+        const char *value = std::getenv("STRATA_GLM_MTP_LOOKUP_POLICY");
+        if (!value || !*value || std::string(value) == "replace") return false;
+        if (std::string(value) == "cost") return true;
+        throw std::invalid_argument("GLM: MTP lookup policy must be replace or cost");
+    }();
+    double width_ms[17];
+    {
+        // Verify time per window width, measured on TR16 with configs/glm53f-q2-v3.json (assembled Q23, CPU
+        // experts, 2026-10-12): 4-token windows 147-149 ms (MTP depth 3 rounds), 7-token windows 239-255 ms
+        // (lookup rounds), about 31 ms per token; other widths extrapolated linearly. The running averages
+        // refine these for other configurations.
+        for (int w = 1; w < 17; ++w) width_ms[w] = 148.0 + 31.0 * (w - 4);
+    }
+    // Optimistic per-token acceptance by match length (4-7, 8-15, 16-23, 24+ tokens): a policy that starts
+    // pessimistic never takes a lookup round and so never learns that long matches are usually right.
+    double mtp_tokens_avg = 3.4, mtp_round_avg = 160.0, lookup_rate[4] = {0.55, 0.75, 0.88, 0.95};
+    int cost_lookup_rounds = 0, cost_lookup_declined = 0;
     // A rejection after accepting n drafts restores n+1 target positions.
     // Limiting proposals to the retained slots keeps every rejection prefix
     // restorable instead of paying for another CPU expert pass.
@@ -8893,9 +8915,24 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
         int32_t lookup_tokens[7];
         const int from_lookup = lookup_depth ? lookup->propose(
             std::min(lookup_depth, max_new - stats.generated - 1), lookup_tokens) : 0;
-        const bool use_lookup = from_lookup >= 2;
+        bool use_lookup = from_lookup >= 2;
+        int lookup_k = from_lookup;
+        // A match of 24+ tokens is taken whole: edit-style answers repeat long spans almost verbatim.
+        if (use_lookup && cost_policy && lookup->last_match() >= 24) ++cost_lookup_rounds;
+        else if (use_lookup && cost_policy) {
+            const double rate = lookup_rate[std::min(3, lookup->last_match() / 8)];
+            double best = mtp_tokens_avg / mtp_round_avg, expected = 1.0, survive = 1.0;
+            lookup_k = 0;
+            for (int i = 1; i <= from_lookup; ++i) {
+                survive *= rate; expected += survive;
+                const double value = expected / (width_ms[std::min(16, i + 1)] + 1.0);
+                if (value > best) { best = value; lookup_k = i; }
+            }
+            use_lookup = lookup_k >= 2;
+            if (use_lookup) ++cost_lookup_rounds; else ++cost_lookup_declined;
+        }
         int selected_match = use_lookup ? lookup->last_match() : 0;
-        int k = use_lookup ? from_lookup : std::min(depth, max_new - stats.generated - 1);
+        int k = use_lookup ? lookup_k : std::min(depth, max_new - stats.generated - 1);
         if (!k) {
             const int pos = decoder.token_position();
             logits = decoder.step(anchor);
@@ -8947,6 +8984,18 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
             if (stats.stopped) break;
         }
         stats.accepted += accepted;
+        if (cost_policy) {
+            const int width = std::min<int>(16, (int)window.size());
+            width_ms[width] = 0.9 * width_ms[width] + 0.1 * elapsed_ms(verify_start);
+            if (use_lookup) {
+                // per-token acceptance (geometric): accepted tokens over accepted + the first rejected one
+                auto &rate = lookup_rate[std::min(3, selected_match / 8)];
+                rate = 0.85 * rate + 0.15 * accepted / (accepted + (accepted < k ? 1 : 0));
+            } else {
+                mtp_tokens_avg = 0.9 * mtp_tokens_avg + 0.1 * (accepted + 1);
+                mtp_round_avg = 0.9 * mtp_round_avg + 0.1 * elapsed_ms(draft_start);
+            }
+        }
         for (int i = 0; i < std::min(accepted, mtp_proposals); ++i) ++mtp_position_accepted[i];
         if (lookup_proposals) {
             ++lookup_rounds; lookup_proposed += lookup_proposals;
@@ -8997,6 +9046,10 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
                                           << " skipped=" << margin_skipped << '\n';
     if (lookup) std::cerr << "MTP_LOOKUP rounds=" << lookup_rounds << " proposed=" << lookup_proposed
                           << " accepted=" << lookup_accepted << " max_depth=" << lookup_depth << '\n';
+    if (lookup && cost_policy)
+        std::cerr << "MTP_LOOKUP_POLICY cost lookup_rounds=" << cost_lookup_rounds << " declined=" << cost_lookup_declined
+                  << " mtp_tokens=" << mtp_tokens_avg << " mtp_round_ms=" << mtp_round_avg << " rate=" << lookup_rate[0]
+                  << ',' << lookup_rate[1] << ',' << lookup_rate[2] << ',' << lookup_rate[3] << '\n';
     for (size_t i = 0; lookup && i < match_stats.size(); ++i)
         if (match_stats[i].rounds) std::cerr << "MTP_LOOKUP_MATCH bucket=" << i
             << " rounds=" << match_stats[i].rounds << " proposed=" << match_stats[i].proposed
