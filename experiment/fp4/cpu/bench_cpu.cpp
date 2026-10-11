@@ -16,7 +16,10 @@
 #include <immintrin.h>
 #include <omp.h>
 
+#include "kq_cpu.h"
+
 #include <cstdlib>
+#include <array>
 #include <functional>
 #include <sstream>
 
@@ -354,7 +357,7 @@ struct Opts {
     int layer = 1, sets = 4, iters = 20, warmup = 3;
     std::vector<int> threads = {1, 2, 4, 8, 16, 32};
     std::vector<int> ncols = {1, 2, 4, 8};
-    bool selftest = false, only_moe = false;
+    bool selftest = false, only_moe = false, kquant = true, mx = true;
 };
 
 std::vector<int> parse_list(const char* s) {
@@ -434,9 +437,12 @@ int main(int argc, char** argv) {
         else if (a == "--csv") o.csv = next();
         else if (a == "--selftest") o.selftest = true;
         else if (a == "--moe-only") o.only_moe = true;
+        else if (a == "--no-kquant") o.kquant = false;
+        else if (a == "--kquant-only") o.mx = false;
         else {
             printf("usage: bench_cpu [--weights dummy|real] [--model DIR] [--layer L] [--sets S] [--iters N]\n"
-                   "                 [--threads 1,2,..] [--ncols 1,2,4,8] [--csv FILE] [--selftest] [--moe-only]\n");
+                   "                 [--threads 1,2,..] [--ncols 1,2,4,8] [--csv FILE] [--selftest] [--moe-only]\n"
+                   "                 [--no-kquant | --kquant-only]   (Q2_K/Q3_K: Strata q23 pack and ggml-org Q2_K mixes)\n");
             return a == "--help" ? 0 : 2;
         }
     }
@@ -470,7 +476,59 @@ int main(int argc, char** argv) {
         for (int i = 0; i < 16; ++i) printf(" %.3f", hist[i] / double(2 * x.guq.size()));
         printf("\n");
     }
-    if (o.selftest) return selftest(experts) ? 1 : 0;
+    // K-quant copies of every expert: Q2_K gate/up, Q3_K down (what strata-mimo-q2-pack writes, uncalibrated).
+    std::vector<kq::KMat> kgu, kdn;
+    if (o.kquant) {
+        double t0 = now_s();
+        kgu.resize(experts.size());
+        kdn.resize(experts.size());
+        std::vector<double> e_gu(experts.size()), e_dn(experts.size());
+#pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < int(experts.size()) * 2; ++i) {
+            const int e = i / 2;
+            if (i & 1) kdn[e] = requant(experts[e].dn(), KType::Q3K, &e_dn[e]);
+            else kgu[e] = requant(experts[e].gu(), KType::Q2K, &e_gu[e]);
+        }
+        double sg = 0, sd = 0;
+        for (size_t e = 0; e < experts.size(); ++e) { sg += e_gu[e]; sd += e_dn[e]; }
+        printf("requantized %zu experts in %.1f s: weight NMSE vs MXFP4 source: Q2_K gate/up %.4f, Q3_K down %.4f\n",
+               experts.size(), now_s() - t0, sg / experts.size(), sd / experts.size());
+    }
+    if (o.selftest) {
+        int fails = selftest(experts);
+        if (o.kquant) {  // K-quant kernels against fp64 on the requantized weights
+            auto x = make_activation(mimo::kHidden, 7), xi = make_activation(mimo::kExpertInter, 8);
+            std::vector<BlockQ8K> qx(mimo::kHidden / QKK), qi(mimo::kExpertInter / QKK);
+            quantize_row_q8k(x.data(), qx.data(), mimo::kHidden);
+            quantize_row_q8k(xi.data(), qi.data(), mimo::kExpertInter);
+            for (int which = 0; which < 2; ++which) {
+                const KMat& m = which ? kdn[0] : kgu[0];
+                const auto& xv = which ? xi : x;
+                std::vector<double> ref(m.rows);
+                std::vector<float> got(m.rows);
+                for (int r = 0; r < m.rows; ++r) {
+                    ref[r] = m.ref_dot(r, xv.data());
+                    const uint8_t* p = m.row(r);
+                    got[r] = which ? kq::dot_q3k((const BlockQ3K*)p, qi.data(), m.cols / QKK)
+                                   : kq::dot_q2k((const BlockQ2K*)p, qx.data(), m.cols / QKK);
+                }
+                // exactness: the same fp64 dot on the dequantized q8_K activation
+                const auto& qv = which ? qi : qx;
+                std::vector<float> xq(m.cols);
+                for (int b = 0; b < m.cols / QKK; ++b)
+                    for (int j = 0; j < QKK; ++j) xq[b * QKK + j] = qv[b].d * qv[b].qs[j];
+                std::vector<double> refq(m.rows);
+                for (int r = 0; r < m.rows; ++r) refq[r] = m.ref_dot(r, xq.data());
+                ErrStats e = compare(got.data(), ref.data(), m.rows), eq = compare(got.data(), refq.data(), m.rows);
+                bool ok = e.finite && eq.rel_l2 < 1e-5;
+                fails += !ok;
+                printf("  %-14s %-4s relL2=%.3e (q8_K per-256 activations), vs fp64 on its quantized input %.2e %s\n",
+                       which ? "kq_q3k" : "kq_q2k", which ? "down" : "gu", e.rel_l2, eq.rel_l2, ok ? "EXACT" : "FAIL");
+            }
+        }
+        printf("selftest (incl. K-quant): %s\n", fails ? "FAILED" : "passed");
+        return fails ? 1 : 0;
+    }
 
     Csv csv(o.csv);
     const char* wl = o.weights.c_str();
@@ -519,7 +577,7 @@ int main(int argc, char** argv) {
             return stats_of(t);
         };
 
-        if (!o.only_moe) {
+        if (o.mx && !o.only_moe) {
             for (const Kernel& k : kKernels) {
                 Stats s = time_it([&](int i) { gemv_set(sets[i % o.sets].gu, ax, out.data(), k.fn); });
                 gemv_set(sets[0].gu, ax, out.data(), k.fn);
@@ -552,7 +610,7 @@ int main(int argc, char** argv) {
         // Full MoE layer with the two best candidates.
         for (const Kernel& k : kKernels) {
             std::string n = k.name;
-            if (n != "c3_q8_off_r2" && n != "c3h_q8_off" && n != "c2_q8_sign") continue;
+            if (!o.mx || (n != "c3_q8_off_r2" && n != "c3h_q8_off" && n != "c2_q8_sign")) continue;
             MoeScratch w;
             w.gu.resize(size_t(mimo::kTopK) * 2 * mimo::kExpertInter);
             w.h.resize(size_t(mimo::kTopK) * mimo::kExpertInter);
@@ -562,6 +620,64 @@ int main(int argc, char** argv) {
                     2.0 * (gu_bytes + dn_bytes) / 0.53125, 0, 0, hash_floats(w.y.data(), mimo::kHidden));
             printf("     -> %s: %.2f ms per MoE layer => %.1f tok/s for 47 MoE layers (experts only)\n", k.name,
                    s.med / 1e3, 1e6 / (s.med * mimo::kMoeLayers));
+        }
+        if (o.kquant) {
+            const int TOPK = mimo::kTopK, H = mimo::kHidden, I = mimo::kExpertInter;
+            std::vector<std::array<kq::PMat, 8>> kg(o.sets), kd(o.sets);
+            for (int s = 0; s < o.sets; ++s)
+                for (int k = 0; k < TOPK; ++k) { kg[s][k] = kq::place(kgu[s * TOPK + k], kChunk); kd[s][k] = kq::place(kdn[s * TOPK + k], kChunk); }
+            const double kgu_bytes = TOPK * double(kgu[0].bytes()), kdn_bytes = TOPK * double(kdn[0].bytes());
+            std::vector<BlockQ8K> qx(H / QKK), qh(size_t(TOPK) * I / QKK);
+            quantize_row_q8k(x.data(), qx.data(), H);
+            for (int k = 0; k < TOPK; ++k) quantize_row_q8k(xi.data(), qh.data() + k * (I / QKK), I);
+            std::vector<double> rgu(H), rdn(H);
+            for (int r = 0; r < H; ++r) { rgu[r] = kgu[0].ref_dot(r, x.data()); rdn[r] = kdn[0].ref_dot(r, xi.data()); }
+            Stats st = time_it([&](int i) { kq::gemv_set(kg[i % o.sets].data(), qx.data(), 0, out.data(), kChunk); });
+            ErrStats e = compare(out.data(), rgu.data(), H);
+            csv.row("cpu", "kq_q2k_ggml", "gu8", wl, 1, cfg, st, kgu_bytes, peak, 2.0 * TOPK * double(H) * H, e.rel_l2, e.max_abs, hash_floats(out.data(), H));
+            st = time_it([&](int i) { kq::gemv_set(kd[i % o.sets].data(), qh.data(), I / QKK, out.data(), kChunk); });
+            e = compare(out.data(), rdn.data(), H);
+            csv.row("cpu", "kq_q3k_ggml", "down8", wl, 1, cfg, st, kdn_bytes, peak, 2.0 * TOPK * double(H) * I, e.rel_l2, e.max_abs, hash_floats(out.data(), H));
+            // Full MoE layers: q23 (Q2_K gate/up + Q3_K down) and ggml-org's mix (Q2_K gate/up + MXFP4 down).
+            std::vector<float> gu(size_t(TOPK) * 2 * I), h(size_t(TOPK) * I), y(H);
+            MoeScratch w;
+            w.gu.resize(gu.size()); w.h.resize(h.size()); w.y.resize(H);
+            for (int mix = 0; mix < 2; ++mix) {
+                auto layer = [&](int i) {
+                    const int s = i % o.sets;
+                    quantize_row_q8k(x.data(), qx.data(), H);
+                    kq::gemv_set(kg[s].data(), qx.data(), 0, gu.data(), kChunk);
+#pragma omp parallel for schedule(static, 1)
+                    for (int k = 0; k < TOPK; ++k) {
+                        float* g = gu.data() + size_t(k) * 2 * I;
+                        for (int j = 0; j < I; ++j) h[size_t(k) * I + j] = g[j] / (1.f + std::exp(-g[j])) * g[I + j];
+                        if (mix == 0) quantize_row_q8k(h.data() + size_t(k) * I, qh.data() + k * (I / QKK), I);
+                        else quantize_act_fast(h.data() + size_t(k) * I, I, w.ah[k]);
+                    }
+#pragma omp parallel for schedule(static)
+                    for (int c = 0; c < H / kChunk; ++c) {
+                        float acc[kChunk] = {}, tmp[kChunk];
+                        for (int k = 0; k < TOPK; ++k) {
+                            if (mix == 0) {
+                                for (int r = 0; r < kChunk; ++r) acc[r] += sets[s].route[k] * kq::dot_row(kd[s][k], c * kChunk + r, qh.data() + k * (I / QKK));
+                            } else {
+                                const Mat& m = sets[s].dn[k];
+                                c3_q8_off<1>(m.q + size_t(c) * kChunk * m.cols / 2, m.e + size_t(c) * kChunk * m.cols / QK, m.cols, w.ah[k], tmp, kChunk);
+                                for (int r = 0; r < kChunk; ++r) acc[r] += sets[s].route[k] * tmp[r];
+                            }
+                        }
+                        std::memcpy(y.data() + c * kChunk, acc, sizeof acc);
+                    }
+                };
+                st = time_it(layer);
+                const double bytes = kgu_bytes + (mix == 0 ? kdn_bytes : dn_bytes);
+                const char* name = mix == 0 ? "moe_q23_strata" : "moe_q2k_mxdown_ggmlorg";
+                csv.row("cpu", name, "moe_layer", wl, 1, cfg, st, bytes, peak, 2.0 * TOPK * 3.0 * H * I, 0, 0, hash_floats(y.data(), H));
+                printf("     -> %s: %.2f ms per MoE layer, %.1f MB => %.1f tok/s for 47 MoE layers (experts only)\n", name,
+                       st.med / 1e3, bytes / 1e6, 1e6 / (st.med * mimo::kMoeLayers));
+            }
+            for (int s = 0; s < o.sets; ++s)
+                for (int k = 0; k < TOPK; ++k) { kq::unplace(kg[s][k]); kq::unplace(kd[s][k]); }
         }
         for (auto& st : sets)
             for (int k = 0; k < mimo::kTopK; ++k) { unplace(st.gu[k]); unplace(st.dn[k]); }

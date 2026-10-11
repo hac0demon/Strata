@@ -92,6 +92,33 @@ Fragment reuse (32x32 warp tiles, ldmatrix) changed little, because the GEMM is 
 At T = 2048 a weight byte feeds about 128 MACs, below the ridge point of about 450 MAC/byte for FP4.
 
 
+## K-quant experts: Strata q23 pack and ggml-org Q2_K mix (added 2026-10-11)
+
+`common/kquant.h` ports ggml's Q2_K/Q3_K blocks, reference quantizers (no imatrix: the uncalibrated path of
+`strata-mimo-q2-pack`) and q8_K activations. Every expert is requantized from MXFP4 (exact f32 dequant first);
+on real layer-1 experts that costs a weight NMSE of 0.10-0.12 for Q2_K gate/up and 0.021-0.024 for Q3_K down.
+
+- CPU (`cpu/kq_cpu.h`): AVX2 ports of `ggml_vec_dot_q2_K_q8_K` / `q3_K`; full MoE layers for the q23 mix
+  (Q2_K gate/up + Q3_K down, 72.9 MB per layer) and ggml-org's Q2_K GGUF mix (Q2_K gate/up + MXFP4 down,
+  79.7 MB). Selftest: exact against fp64 on the q8_K-quantized input (<= 5e-7); the per-256 q8_K activation
+  scale itself costs 2-4% with the outlier activations used here. **CPU timing not yet measured** (the
+  machine was busy with conversions); `bench_cpu` runs it by default (`--no-kquant` / `--kquant-only`).
+- GPU (`gpu/kq_gpu.cuh`): dp4a GEMVs on the native 84/110-byte blocks with int8 activations per 32 (plus
+  per-16 sums for the Q2_K mins), R rows per lane group so loads overlap; fused 2-launch MoE layers.
+  Exact against fp64 on their quantized input (6/6 in `--mode selftest`). Measured (`--mode kquant`,
+  real layer-1 experts, `results/20261011-1822/gpu_kquant_real.csv`; taken while a CPU-heavy conversion ran):
+
+  | kernel | us per call | GB/s |
+  |---|---:|---:|
+  | Q2_K gate+up, 8 experts (44.1 MB), 1 / 2 / 4 rows per lane group | 173 / 111 / 110 | 254 / 395 / 400 |
+  | Q3_K down, 8 experts (28.8 MB), 1 / 2 / 4 rows | 103 / 85 / 79 | 281 / 338 / 364 |
+  | fused MoE layer, q23 mix | 253 (275 per layer in a 47-layer graph) | 288 |
+  | fused MoE layer, Q2_K + MXFP4 down | 232 (264 in the graph) | 343 |
+
+  With one row per lane group the K-quant GEMVs were latency bound (60% of bandwidth); four rows reach 95%.
+  The q23 layer is 32% fewer bytes than MXFP4 but only about 10% faster per layer: the fused gate/up kernel
+  re-quantizes x in every CTA and the Q3_K down kernel stays below 90% of bandwidth.
+
 ## What the weights look like
 
 MiMo-V2.6-Flash-RL: 48 layers (layer 0 dense, 47 MoE), hidden 4096, 256 routed experts, top-8, no shared

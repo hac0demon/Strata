@@ -11,8 +11,10 @@
 //   k0_i8 k1_f8fold k2_f16fold (software, no FP4 hardware) and k3_mxf8 k4_mxf4 k5_msd (sm_120a block-scaled)
 #include "../common/mxfp4.h"
 #include "../common/report.h"
+#include "../common/kquant.h"
 #include "../common/weights.h"
 #include "common.cuh"
+#include "kq_gpu.cuh"
 
 #include <omp.h>
 
@@ -716,6 +718,158 @@ void run_prefill(Ctx& c, bool selftest) {
     }
 }
 
+
+// ---------------- K-quant experts (Strata q23 pack, ggml-org Q2_K GGUF) ----------------
+struct KAct { DBuf<int8_t> q; DBuf<float> d; DBuf<int> s16; };
+KAct prep_kact(const std::vector<float>& X, int ntok, int K, std::vector<float>* deq = nullptr) {
+    std::vector<int8_t> q(size_t(ntok) * K);
+    std::vector<float> d(size_t(ntok) * K / 32);
+    std::vector<int> s16(size_t(ntok) * K / 16);
+    if (deq) deq->resize(X.size());
+    for (size_t b = 0; b < size_t(ntok) * K / 32; ++b) {
+        float m = 0;
+        for (int i = 0; i < 32; ++i) m = std::max(m, std::fabs(X[b * 32 + i]));
+        const float id = m > 0 ? 127.f / m : 0.f;
+        d[b] = m / 127.f;
+        for (int i = 0; i < 32; ++i) {
+            const int v = (int)std::nearbyint(X[b * 32 + i] * id);
+            q[b * 32 + i] = (int8_t)v;
+            s16[b * 2 + i / 16] += v;
+            if (deq) (*deq)[b * 32 + i] = v * d[b];
+        }
+    }
+    KAct a;
+    a.q.up(q); a.d.up(d); a.s16.up(s16);
+    return a;
+}
+
+void run_kquant(Ctx& c, bool selftest) {
+    const int P = c.pool.P;
+    printf("== K-quant experts: Q2_K gate/up, Q3_K down (Strata q23 pack) and Q2_K + MXFP4 down (ggml-org) ==\n");
+    double t0 = now_s();
+    std::vector<KMat> kgu(P), kdn(P);
+    double nmse_gu = 0, nmse_dn = 0;
+#pragma omp parallel for schedule(dynamic) reduction(+ : nmse_gu, nmse_dn)
+    for (int i = 0; i < 2 * P; ++i) {
+        double e = 0;
+        if (i & 1) { kdn[i / 2] = requant(c.pool.host[i / 2].dn(), KType::Q3K, &e); nmse_dn += e; }
+        else { kgu[i / 2] = requant(c.pool.host[i / 2].gu(), KType::Q2K, &e); nmse_gu += e; }
+    }
+    const size_t gu_es = kgu[0].bytes(), dn_es = kdn[0].bytes();
+    DBuf<uint8_t> dgu(size_t(P) * gu_es), ddn(size_t(P) * dn_es);
+    for (int e = 0; e < P; ++e) {
+        CK(cudaMemcpy(dgu.p + size_t(e) * gu_es, kgu[e].data.data(), gu_es, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(ddn.p + size_t(e) * dn_es, kdn[e].data.data(), dn_es, cudaMemcpyHostToDevice));
+    }
+    printf("requantized %d experts in %.1f s (weight NMSE vs MXFP4: Q2_K gate/up %.4f, Q3_K down %.4f); %.2f + %.2f MB per expert\n",
+           P, now_s() - t0, nmse_gu / P, nmse_dn / P, gu_es / 1e6, dn_es / 1e6);
+
+    // GEMV: 8 experts per call, rotating sets
+    for (int gu = 1; gu >= 0; --gu) {
+        const int rows = gu ? 2 * I : H, K = gu ? H : I, nact = gu ? 1 : TOPK;
+        std::vector<float> X(size_t(nact) * K);
+        for (int t = 0; t < nact; ++t) { auto x = make_activation(K, 3000 + t); std::memcpy(&X[size_t(t) * K], x.data(), K * 4); }
+        std::vector<float> Xq;
+        KAct a = prep_kact(X, nact, K, &Xq);
+        std::vector<double> ref(size_t(TOPK) * rows), refq(size_t(TOPK) * rows);
+#pragma omp parallel for collapse(2)
+        for (int k = 0; k < TOPK; ++k)
+            for (int r = 0; r < rows; ++r) {
+                const KMat& m = gu ? kgu[k] : kdn[k];
+                const size_t xo = size_t(gu ? 0 : k) * K;
+                ref[size_t(k) * rows + r] = m.ref_dot(r, X.data() + xo);
+                refq[size_t(k) * rows + r] = m.ref_dot(r, Xq.data() + xo);
+            }
+        DBuf<float> out(size_t(TOPK) * rows);
+        const int rpw = 32 / (2 * K / 256);
+        for (int R : {1, 2, 4}) {
+            dim3 grid(rows / (8 * rpw * R), TOPK);
+            auto f = [&](int it) {
+                const int s = selftest ? 0 : it % c.nsets;
+                const int* ids = c.ids.p + 8 * s;
+                if (gu) {
+                    if (R == 1) kqg::k_kq_gemv<false, 1><<<grid, 256>>>(dgu.p, gu_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 0, out.p);
+                    if (R == 2) kqg::k_kq_gemv<false, 2><<<grid, 256>>>(dgu.p, gu_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 0, out.p);
+                    if (R == 4) kqg::k_kq_gemv<false, 4><<<grid, 256>>>(dgu.p, gu_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 0, out.p);
+                } else {
+                    if (R == 1) kqg::k_kq_gemv<true, 1><<<grid, 256>>>(ddn.p, dn_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 1, out.p);
+                    if (R == 2) kqg::k_kq_gemv<true, 2><<<grid, 256>>>(ddn.p, dn_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 1, out.p);
+                    if (R == 4) kqg::k_kq_gemv<true, 4><<<grid, 256>>>(ddn.p, dn_es, ids, rows, K, a.q.p, a.d.p, a.s16.p, 1, out.p);
+                }
+            };
+            Stats st = selftest ? Stats{} : c.tm.run(f, c.o.reps, c.o.trials);
+            f(0);
+            CK(cudaDeviceSynchronize());
+            auto h = out.down(size_t(TOPK) * rows);
+            ErrStats e = compare(h.data(), ref.data(), h.size()), eq = compare(h.data(), refq.data(), h.size());
+            c.csv->row("gpu", gu ? "kq_q2k_dp4a" : "kq_q3k_dp4a", gu ? "gu8" : "down8", c.wl(), 1, "rows" + std::to_string(R), st,
+                       TOPK * double(gu ? gu_es : dn_es), c.peak, 2.0 * TOPK * rows * double(K), e.rel_l2, e.max_abs, hash_floats(h.data(), h.size()));
+            if (selftest) printf("     exactness vs fp64 on its quantized activations: relL2=%.2e %s\n", eq.rel_l2, eq.rel_l2 < 1e-5 ? "EXACT" : "MISMATCH");
+        }
+    }
+
+    // Fused MoE layers
+    auto x = make_activation(H, 77);
+    DBuf<float> dx(H), dy(H), hd(TOPK * I / 32);
+    DBuf<int8_t> hq(TOPK * I);
+    DBuf<int> hs(TOPK * I / 16);
+    dx.up(x);
+    std::vector<float> rh(TOPK);
+    CK(cudaMemcpy(rh.data(), c.route.p, TOPK * 4, cudaMemcpyDeviceToHost));
+    for (int mix = 0; mix < 2; ++mix) {
+        auto layer = [&](int s, cudaStream_t st) {
+            if (mix == 0) {
+                kqg::k_moe_gu_q2k<false><<<dim3(I / 32, TOPK), 256, 0, st>>>(dgu.p, gu_es, c.ids.p + 8 * s, dx.p, hq.p, hd.p, hs.p);
+                kqg::k_moe_down_q3k<<<H / 32, 256, 0, st>>>(ddn.p, dn_es, c.ids.p + 8 * s, c.route.p + 8 * s, hq.p, hd.p, dy.p);
+            } else {
+                kqg::k_moe_gu_q2k<true><<<dim3(I / 32, TOPK), 256, 0, st>>>(dgu.p, gu_es, c.ids.p + 8 * s, dx.p, hq.p, hd.p, hs.p);
+                k_moe_down<2><<<H / 16, 256, 0, st>>>(c.pool.dnq.p, c.pool.dne.p, c.pool.dnq_es, c.pool.dne_es, c.ids.p + 8 * s,
+                                                      c.route.p + 8 * s, hq.p, hd.p, dy.p);
+            }
+        };
+        std::vector<double> ref(H, 0.0);
+        {
+            std::vector<double> part(size_t(TOPK) * H);
+#pragma omp parallel for
+            for (int k = 0; k < TOPK; ++k) {
+                std::vector<double> g(2 * I);
+                for (int r = 0; r < 2 * I; ++r) g[r] = kgu[k].ref_dot(r, x.data());
+                std::vector<float> h(I);
+                for (int i = 0; i < I; ++i) h[i] = float(g[i] / (1 + std::exp(-g[i])) * g[I + i]);
+                for (int r = 0; r < H; ++r) part[size_t(k) * H + r] = rh[k] * (mix == 0 ? kdn[k].ref_dot(r, h.data()) : ref_dot_row(c.pool.host[k].dn(), r, h.data()));
+            }
+            for (int k = 0; k < TOPK; ++k)
+                for (int r = 0; r < H; ++r) ref[r] += part[size_t(k) * H + r];
+        }
+        const double bytes = TOPK * double(gu_es) + (mix == 0 ? TOPK * double(dn_es) : TOPK * double(H) * I * 0.53125);
+        const char* name = mix == 0 ? "moe_q23_strata" : "moe_q2k_mxdown_ggmlorg";
+        Stats st{};
+        if (!selftest) st = c.tm.run([&](int it) { layer(it % c.nsets, 0); }, c.o.reps, c.o.trials);
+        layer(0, 0);
+        CK(cudaDeviceSynchronize());
+        auto y = dy.down(H);
+        ErrStats e = compare(y.data(), ref.data(), H);
+        c.csv->row("gpu", name, "moe_layer", c.wl(), 1, "2launch", st, bytes, c.peak, 2.0 * TOPK * 3.0 * H * I, e.rel_l2, e.max_abs, hash_floats(y.data(), H));
+        if (selftest) continue;
+        cudaStream_t sm;
+        CK(cudaStreamCreate(&sm));
+        cudaGraph_t g;
+        cudaGraphExec_t ge;
+        CK(cudaStreamBeginCapture(sm, cudaStreamCaptureModeGlobal));
+        for (int l = 0; l < mimo::kMoeLayers; ++l) layer(l % c.nsets, sm);
+        CK(cudaStreamEndCapture(sm, &g));
+        CK(cudaGraphInstantiate(&ge, g, 0));
+        Stats sg = c.tm.run([&](int) { CK(cudaGraphLaunch(ge, 0)); }, 5, c.o.trials);
+        Stats per{sg.med / mimo::kMoeLayers, sg.p10 / mimo::kMoeLayers, sg.p90 / mimo::kMoeLayers, sg.min / mimo::kMoeLayers};
+        c.csv->row("gpu", name, "moe47_graph", c.wl(), 1, "per_layer", per, bytes, c.peak, 2.0 * TOPK * 3.0 * H * I, 0, 0, 0);
+        printf("     -> %s: 47 MoE layers %.2f ms => %.1f tok/s (expert part, all experts resident), %.1f MB per layer\n", name,
+               sg.med / 1e3, 1e6 / sg.med, bytes / 1e6);
+        cudaGraphExecDestroy(ge);
+        cudaGraphDestroy(g);
+        cudaStreamDestroy(sm);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -736,7 +890,7 @@ int main(int argc, char** argv) {
         else if (a == "--trials") o.trials = std::atoi(next());
         else if (a == "--csv") o.csv = next();
         else {
-            printf("usage: bench_gpu [--mode selftest|peak|decode|moe|prefill|all] [--weights dummy|real] [--model DIR]\n"
+            printf("usage: bench_gpu [--mode selftest|peak|decode|moe|prefill|kquant|all] [--weights dummy|real] [--model DIR]\n"
                    "                 [--layer L] [--experts P] [--tokens 512,2048] [--ncols 1,2,4] [--kinds 0,1,..]\n"
                    "                 [--reps R] [--trials T] [--csv FILE]\n");
             return a == "--help" ? 0 : 2;
@@ -800,6 +954,7 @@ int main(int argc, char** argv) {
         run_decode(c, true);
         run_moe(c, true);
         run_prefill(c, true);
+        run_kquant(c, true);
         printf("selftest done: check relL2 column (q8/fp8/fp4 activations ~1e-2, fp16 ~1e-3, HIGH = broken)\n");
         return 0;
     }
@@ -813,5 +968,6 @@ int main(int argc, char** argv) {
     if (o.mode == "decode" || o.mode == "all") run_decode(c, false);
     if (o.mode == "moe" || o.mode == "all") run_moe(c, false);
     if (o.mode == "prefill" || o.mode == "all") run_prefill(c, false);
+    if (o.mode == "kquant" || o.mode == "all") run_kquant(c, false);
     return 0;
 }
