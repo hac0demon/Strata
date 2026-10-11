@@ -136,6 +136,8 @@ class HardwareConfig:
     remote: Node = dataclasses.field(default_factory=Node)
     workers: list = dataclasses.field(default_factory=list)   # WorkerNode list (multinode model); empty = legacy `remote`
     runtime_vram: dict = dataclasses.field(default_factory=dict)
+    fixed_weight_bytes: dict = dataclasses.field(default_factory=dict) # optional exact deployed GGUF census
+    fixed_weight_pack: str = ""       # restrict an exact census to its deployed pack
     notes: str = ""
 
     def to_dict(self):

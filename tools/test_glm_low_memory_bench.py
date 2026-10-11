@@ -2,10 +2,31 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from glm_low_memory_bench import cache_bytes, eval_counts, eval_complete, gpu_capacity_passed, gpu_used_limit, gpu_snapshot, gpu_usage, group_stats, hip_gpu_snapshot, model_files, parse_log
+from glm_low_memory_bench import validate_hip_link, decode_complete, cache_bytes, eval_counts, eval_complete, gpu_capacity_passed, gpu_used_limit, gpu_snapshot, gpu_usage, group_stats, hip_gpu_snapshot, model_files, parse_log
 
 
 class LowMemoryBenchTest(unittest.TestCase):
+    def test_pci_preflight_rejects_cached_memory_after_bus_loss(self):
+        with tempfile.TemporaryDirectory() as folder:
+            device=Path(folder)
+            (device/'config').write_bytes(bytes.fromhex('02105075'))
+            validate_hip_link(device)
+            (device/'mem_info_vram_total').write_text(str(16*2**30))
+            (device/'mem_info_vram_used').write_text(str(2**30))
+            self.assertNotIn('performance',hip_gpu_snapshot(device,False,True))
+            (device/'config').write_bytes(b'\xff'*4)
+            with self.assertRaises(ValueError):hip_gpu_snapshot(device,False,True)
+            (device/'config').write_bytes(b'\x02')
+            with self.assertRaises(ValueError):validate_hip_link(device)
+
+    def test_eos_completion_and_partial_output(self):
+        rows=[dict(kind='single',tokens=2),dict(kind='external',tokens=4)]
+        self.assertTrue(decode_complete([1,2,9,1,2,3,4],rows,4,2,[9]))
+        self.assertFalse(decode_complete([1,2,3,1,2,3,4],rows,4,2,[9]))
+        self.assertFalse(decode_complete([1,9,9,1,2,3,4],rows,4,2,[9]))
+        self.assertFalse(decode_complete([1,2,9,1,2,3],rows,4,2,[9]))
+        self.assertFalse(decode_complete([1,2,9,1,2,3,4,5],rows,4,2,[9]))
+
     def test_timing_scopes_and_missing_measurements(self):
         log = """PREFILL trial=0 tokens=128 batch=64 ms=80000.5 tok_s=1.6
 PREFILL trial=1 tokens=128 batch=64 ms=64000 tok_s=2

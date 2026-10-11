@@ -168,6 +168,8 @@ PACKS = {
                             44: ("Q2_K", "Q2_K", "IQ4_XS")}), skew=0.8),
     "reap50_q23": Pack("reap50_q23", description="REAP-50 (144 experts) in Q2_K/Q3_K, all 42 layers (55.1 GB)",
                        **_uniform(("Q2_K", "Q2_K", "Q3_K"), experts=144), skew=0.8),
+    "reap50_q22": Pack("reap50_q22", description="REAP-50 Q23 assembly with Q2_K down sidecar",
+                       **_uniform(("Q2_K", "Q2_K", "Q2_K"), experts=144), skew=0.8),
     "reap50_q4km": Pack("reap50_q4km", description="REAP-50 Q4_K_M as downloaded (~15.1 MB per expert)",
                         **_uniform(("Q4_K", "Q4_K", "Q6_K"), experts=144), skew=0.8),
     "q8": Pack("q8", description="hypothetical Q8_0 experts (26.7 MB each, 323 GB)",

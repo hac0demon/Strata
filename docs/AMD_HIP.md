@@ -9,6 +9,10 @@ install steps for users are in [INSTALL.md](INSTALL.md#amd-cards). gfx906 (Insti
 opt-in build, see [gfx906](#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source). The Ryzen AI Max "Strix Halo" APU (gfx1151, RDNA3.5, unified memory) is built from source on Linux: see [STRIX_HALO.md](STRIX_HALO.md). Other AMD architectures and mixed
 AMD/NVIDIA execution in one run are not supported.
 
+GLM-5.3f REAP50 also has a separate opt-in [Vulkan runner](GLM_VULKAN.md) with no ROCm runtime dependency.
+It was tested on an RX 9070 XT; other AMD cards remain unvalidated. Its build and short comparisons are
+experimental, and setup continues to select the HIP backend.
+
 The backend maps the CUDA-shaped runtime and BLAS calls to HIP/hipBLAS, uses
 RDNA2/RDNA3/RDNA4's signed integer dot instruction for quantized kernels, and supplies
 wave32 shuffle/packed-byte operations. CUDA-only QSA matrix instructions have
@@ -55,6 +59,91 @@ the kernel's amdgpu driver (no ROCm install needed):
   shows the card's load, VRAM, temperature and power from Linux sysfs (0.1.32).
 
 The rest of setup is the same as on NVIDIA: the model download, the start script, the server.
+
+## Linux GPU bus loss: runtime PM and ASPM troubleshooting
+
+On one B550 / Ryzen 9 3950X / RX 9070 XT (gfx1201) machine, repeated GLM-5.3-Flash
+prefill runs lost the GPU from the PCIe bus. The GPU's audio function also became
+inaccessible, followed by SMU metrics errors, MES queue shutdown timeouts and a
+failed reset with `-19`. No preceding VM fault or illegal-instruction report was
+captured. Removing an InfiniBand card, disabling Resizable BAR in BIOS, and
+rebuilding the vendor DKMS driver without a local clock-cap patch did not
+eliminate the failures in those earlier tests.
+
+The configuration tested on 2026-10-11 used Ubuntu 24.04.5, kernel
+`7.0.0-38-generic`, vendor AMD DKMS `6.19.14.31400100`, HIP `7.14.60850`,
+64 GiB RAM at a user-reported 2666 MT/s, and these Linux boot options:
+
+```text
+amdgpu.runpm=0 amdgpu.aspm=0
+```
+
+`runpm=0` disables idle GPU power-down and resume; normal clock scaling remains
+available. `aspm=0` disables the driver's PCIe link power saving. Idle power may
+increase. The custom `amdgpu.ppfeaturemask=0xfff7ffff` override was removed;
+the driver reported its default mask as `0xfff7bfff`. See the
+[kernel parameter documentation](https://docs.kernel.org/gpu/amdgpu/module-parameters.html).
+These settings are an opt-in troubleshooting workaround, not a setup default.
+Runtime PM and ASPM were changed together. The early successful checks did not
+isolate their effects, and GPU loss recurred later with both options still set.
+
+For a temporary test, edit the Linux command line in GRUB for one boot. To keep
+the workaround, append the two options to the existing `GRUB_CMDLINE_LINUX_DEFAULT`
+in `/etc/default/grub`, remove the custom `amdgpu.ppfeaturemask` option if present,
+then run `sudo update-grub` and reboot. Verify the actual boot with:
+
+```sh
+cat /proc/cmdline
+cat /sys/module/amdgpu/parameters/runpm
+cat /sys/module/amdgpu/parameters/aspm
+cat /sys/module/amdgpu/parameters/ppfeaturemask
+```
+
+### Power cap and measured runs on this machine
+
+With that configuration, `sudo amd-smi set -g 0 --power-cap 212 ppt0` succeeded
+without a custom feature-mask override. Driver hwmon readback showed 212 W,
+default 304 W, and allowed range 212–340 W. These limits belong to this card;
+check the selected GPU's limits before choosing a cap on another machine.
+Read back `power1_cap`, `power1_cap_default`, `power1_cap_min` and `power1_cap_max`
+under the GPU's `device/hwmon/hwmon*/` directory in `/sys/class/drm/`.
+Values are in microwatts: `212000000` means a configured 212 W limit, not an
+instantaneous power measurement. Avoid changing caps during a measured run.
+
+Three sequential fresh-process checks used the same frozen 7936-token prompt,
+8192-token context/batch, 128 output tokens, 12 CPU threads, REAP50 Q23 assembly
+with a Q22 down-only sidecar, and fit4 routing. The harness enforced a 60 GiB
+RAM limit with zero swap and a 15360 MiB GPU allocation budget.
+
+| Prefill mode | Prefill tok/s | Decode tok/s |
+| --- | ---: | ---: |
+| Optimized MMQ | 119.601 | 35.2547 |
+| Custom BF16 WMMA | 465.274 | 35.3772 |
+| Custom BF16 WMMA repeat | 465.073 | 35.3614 |
+
+All three runs completed cleanly with identical 128-token output and no detected
+GPU loss; the endpoint link remained ×16 and the final cap readback remained
+212 W. Compact evidence, executable/prompt hashes and limitations are in
+[the measured record](benchmarks/glm_b550_power212_20261011.json).
+This is one MMQ trial and two WMMA trials, not a long-duration stability claim.
+During subsequent optimization screening on the same boot, 20 further
+uninstrumented runs completed, then a 2048-token MMQ control lost the GPU at
+kernel timestamp `4914.550427`. The first messages were `device lost from bus`,
+SMU metrics export returning `0xFFFFFFFF`, and the audio function becoming
+inaccessible. `runpm=0` and `aspm=0` were verified again; no power-cap command
+was issued during the screening. All GPU testing stopped. These options and
+the 212 W cap have therefore **not established stability**. See the
+[follow-up experiment record](benchmarks/glm_reap50_212w_optimization_20261011.json).
+16K and library BF16 were not tested with this boot configuration. Earlier
+library BF16 failures remain unresolved; no BF16 preset or quality gate changed.
+
+After the runs, the user reported workqueue warnings that
+`svm_range_deferred_list_work [amdgpu]` and `delayed_fput` each used more than
+10000 microseconds of CPU time. These were not accompanied by GPU loss in these
+checks. Record them when investigating stalls or cleanup overhead; the
+`consider switching to WQ_UNBOUND` text concerns kernel workqueue implementation,
+not a Strata launch option. Do not count these messages as proof of GPU recovery
+or dismiss them if they accompany a new failure.
 
 ## Windows
 

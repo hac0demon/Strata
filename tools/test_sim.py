@@ -24,6 +24,31 @@ import vram  # noqa: E402
 from config import RunConfig  # noqa: E402
 
 
+class CurrentExternalTest(unittest.TestCase):
+    def test_sequential_drafts_preserve_greedy_work_and_include_overhead(self):
+        hardware=hw.load(str(ROOT/'tools/sim/data/hw_b550_2666_212w.json'))
+        params=calibration.load_params(ROOT/'tools/sim/data/params_b550_2666_212w.json')
+        cfg=RunConfig(pack='reap50_q22',context=4096,speculation='external',mtp_depth=2,
+            external_sequential=True,external_draft_ms=5,acceptance_probabilities=[1.,1.])
+        plan=decode.make_plan(hardware,cfg,model.pack(cfg.pack))
+        self.assertNotIn('verify_history',plan.items)
+        result=decode.simulate(hardware,cfg,params)
+        self.assertEqual(result.tokens_per_round,3)
+        self.assertAlmostEqual(result.round_ms,result.verify_ms+5)
+        self.assertAlmostEqual(result.verify_ms,result.step.ms)
+        self.assertLess(result.tok_s,1000/(result.verify_ms/3))
+        cfg=cfg.copy(proposal_probability=0)
+        result=decode.simulate(hardware,cfg,params)
+        self.assertEqual(result.tokens_per_round,1)
+        self.assertAlmostEqual(result.round_ms,result.verify_ms+5)
+
+    def test_unmeasured_draft_cost_and_excess_vram_are_rejected(self):
+        cfg=RunConfig(pack='reap50_q22',speculation='external',mtp_depth=1,acceptance_probabilities=[.5])
+        hardware=hw.load(str(ROOT/'tools/sim/data/hw_b550_2666_212w.json'))
+        with self.assertRaises(ValueError):decode.simulate(hardware,cfg)
+        with self.assertRaises(ValueError):decode.simulate(hardware,cfg.copy(external_draft_mib=769,external_draft_ms=2))
+
+
 class ModelTest(unittest.TestCase):
     def test_pack_census_matches_gguf_headers(self):
         self.assertEqual(model.pack("q2_orig").routed_total_bytes(), 99_033_808_896)

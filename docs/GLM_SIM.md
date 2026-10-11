@@ -45,6 +45,44 @@ bandwidth, RAM). Presets:
 
 The original validation below covers `tr16`. B550 has a separate provisional calibration; other presets remain exploratory.
 
+The opt-in [X570S / DDR4-2933 / ECO / ROCm 10.1 profile](../tools/sim/data/hw_x570s_2933_eco_rocm10.json)
+uses the 2026-10-11 measurements: 377.065 GFLOP/s CPU FMA, 42.5959 GB/s
+streaming reads, 28.3107/28.0826 GB/s pinned PCIe transfers, and 1.6103 GB/s
+sequential direct disk reads. CPU and RAM microbenchmarks are proxies for the
+expert kernels. The GPU's measured copy bandwidth (~476 GB/s) and FP32 SGEMM
+(~13.7 TFLOP/s on repeats, with an initial 7.87 result) are observations in
+[its measurement file](../tools/sim/data/measured_x570s_2933_eco_rocm10.json).
+They do not replace the inherited GEMV/tier rates or FP16/INT8 throughput.
+Unmeasured fields and runtime reserves are explicitly listed as inherited.
+The original hardware profiles and calibration remain unchanged.
+
+After a silent power-off and the user's return to DDR4-2666, the separate
+[X570S / DDR4-2666 / ECO profile](../tools/sim/data/hw_x570s_2666_eco_rocm10.json)
+records 38.7299 GB/s at 16 threads and 24.4909 GB/s at one, with pinned PCIe
+transfers of 28.3201/28.084 GB/s. A 46 GiB, ten-minute verified RAM stress test,
+the GPU pre-check and eight kernel tests passed. Synchronized 2K and 8K model
+diagnostics also passed; the earlier power-off cause remains undetermined.
+See the [recovery record](benchmarks/glm_x570s_2666_eco_recovery_20261011.json).
+Kernel terms remain inherited and uncalibrated. The importer excludes
+[fault-traced runs](GLM_GPU_DIAGNOSTICS.md) from performance training.
+
+The same file records greedy 33.7577 tok/s and external sequential 24.8699
+tok/s, with 27.5877 ms of drafting per call, depth-two acceptance 42/48 and
+37/42, and equal outputs within the new environment. It sets
+`external_sequential` so accepted drafts still incur target work. The old
+ROCm control differs starting at token 32; cross-version output quality was
+not evaluated. These are single-prompt, single-run observations, all
+`fit: false`. Inherited B550 parameters miss decode by 24–30% and overpredict
+prefill by about 650%; the new profile is not a qualified timing calibration.
+The validation command deliberately reports these misses:
+
+```sh
+python3 tools/sim/glm_sim.py hw --hw tools/sim/data/hw_x570s_2933_eco_rocm10.json
+python3 tools/sim/glm_sim.py validate --params tools/sim/data/params_b550.json \
+  --records tools/sim/data/measured_x570s_2933_eco_rocm10.json
+```
+
+
 ## What is modeled
 
 **Model and packs** (`model.py`): 45 layers, 3 dense, 42 MoE x 288 experts, top-8, one shared expert, 11 MLA
