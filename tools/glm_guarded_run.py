@@ -146,6 +146,10 @@ def run(config, prompt, output, *, tokens=512, trials=1, timeout=1200, extra=())
                   model_cache_before=cache_before,
                   termination_reason=None, passed=False)
     status_path = output.with_suffix('.guard.json')
+    if cfg.get('backend') == 'vulkan':
+        sources = [ROOT/'CMakeLists.txt', *sorted((ROOT/'vulkan').rglob('*'))]
+        status['source_sha256'].update({str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                                      for path in sources if path.is_file()})
     write_status(status_path, status)
     task_event(events, output.name, 'launch', own_unit=own_unit,
                executable_sha256=status['executable_sha256'],

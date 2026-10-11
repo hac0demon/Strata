@@ -9,6 +9,10 @@ install steps for users are in [INSTALL.md](INSTALL.md#amd-cards). gfx906 (Insti
 opt-in build, see [gfx906](#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source). The Ryzen AI Max "Strix Halo" APU (gfx1151, RDNA3.5, unified memory) is built from source on Linux: see [STRIX_HALO.md](STRIX_HALO.md). Other AMD architectures and mixed
 AMD/NVIDIA execution in one run are not supported.
 
+GLM-5.3f REAP50 also has a separate opt-in [Vulkan runner](GLM_VULKAN.md) with no ROCm runtime dependency.
+It was tested on an RX 9070 XT; other AMD cards remain unvalidated. Its build and short comparisons are
+experimental, and setup continues to select the HIP backend.
+
 The backend maps the CUDA-shaped runtime and BLAS calls to HIP/hipBLAS, uses
 RDNA2/RDNA3/RDNA4's signed integer dot instruction for quantized kernels, and supplies
 wave32 shuffle/packed-byte operations. CUDA-only QSA matrix instructions have

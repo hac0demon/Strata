@@ -21,7 +21,8 @@ def import_run(path, hardware, *, fit=False, components=False, observed=False, r
     instrumented = (c.get('profile_layers') or c.get('decode_checks') or
                     any(k.startswith('STRATA_GLM_CHECK_') for k in env) or
                     any(k in env for k in ['STRATA_GLM_STEP_TRACE', 'STRATA_GLM_ACTIVATION_TRACE',
-                                          'STRATA_GLM_TASK_TRACE', 'STRATA_GLM_TASK_TRACE_SYNC']))
+                                          'STRATA_GLM_TASK_TRACE', 'STRATA_GLM_TASK_TRACE_SYNC',
+                                          'STRATA_GLM_STATE_TRACE_DIR']))
     if instrumented and not components:
         raise ValueError('instrumented run requires component-only import')
     if fit and (instrumented or components or observed):

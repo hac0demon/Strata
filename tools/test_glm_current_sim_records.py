@@ -41,7 +41,8 @@ class ImportCurrentRun(unittest.TestCase):
 
     def test_fault_traces_cannot_be_used_as_performance_training(self):
         for name,value in [('STRATA_GLM_TASK_TRACE','/tmp/engine.jsonl'),
-                           ('STRATA_GLM_TASK_TRACE_SYNC','1')]:
+                           ('STRATA_GLM_TASK_TRACE_SYNC','1'),
+                           ('STRATA_GLM_STATE_TRACE_DIR','/tmp/layers')]:
             row=self.record();row['config']['env'][name]=value
             with self.assertRaisesRegex(ValueError,'instrumented'):
                 self.read(row,fit=True)

@@ -61,7 +61,7 @@ def clear_model_cache(config):
             argv = proc.read_bytes().split(b"\0")
         except (OSError, PermissionError):
             continue
-        if argv and Path(os.fsdecode(argv[0])).name.startswith("strata-glm-decode"):
+        if argv and Path(os.fsdecode(argv[0])).name.startswith(("strata-glm-decode", "strata-glm-vulkan")):
             raise RuntimeError("another GLM decoder is active; cannot clear model cache")
     records = []
     for path in model_files(config):
@@ -238,7 +238,7 @@ def hip_gpu_snapshot(device, telemetry=True, require_pci=False):
 
 
 def read_gpu(config, pid=None):
-    if config.get("backend", "cuda") == "hip":
+    if config.get("backend", "cuda") in ("hip", "vulkan"):
         # Global VRAM includes the engine, driver and every other GPU client.
         # sysfs cannot attribute it to this PID, so do not invent a process value.
         return None, hip_gpu_snapshot(hip_gpu_device(config),config.get('gpu_telemetry',True),
@@ -269,6 +269,34 @@ def eval_counts(path):
     if not counts:
         raise ValueError("empty evaluation corpus")
     return counts
+
+
+def vulkan_command(cfg, args):
+    """Keep unsupported Vulkan features explicit instead of silently ignoring them."""
+    if (args.single or args.eval_corpus or cfg.get('speculative', 'none') != 'none' or
+            cfg.get('decode_graphs') or cfg.get('decode_cache_mib') or
+            cfg.get('decode_cache_slots') or cfg.get('decode_checks') or cfg.get('mtp_greedy_control')):
+        raise ValueError('initial Vulkan runner supports greedy generation without a resident expert tier')
+    if cfg.get('prefill_batch', 1) != 1:
+        raise ValueError('initial Vulkan runner requires sequential prefill_batch=1')
+    if cfg.get('prefill_experts', 'cpu') != 'cpu':
+        raise ValueError('initial Vulkan prefill uses CPU experts')
+    supported = {'STRATA_GLM_MAPPED_LAZY', 'STRATA_GLM_MAPPED_OWNED', 'STRATA_GLM_GPU_RESERVE_MIB',
+                 'STRATA_GLM_TASK_TRACE', 'STRATA_GLM_STATE_TRACE_DIR'}
+    unsupported = [name for name in cfg.get('env', {}) if name.startswith('STRATA_GLM_') and name not in supported]
+    if unsupported:
+        raise ValueError('unsupported Vulkan settings: ' + ', '.join(sorted(unsupported)))
+    command = ['numactl', '--interleave=all', str(Path(cfg['exe']).resolve()),
+               '--model', cfg['model'], '--prompt-file', str(args.prompt.resolve()),
+               '--output', str(args.output.with_suffix('.vulkan.json').resolve()),
+               '--context', str(cfg['context']), '--generate', str(args.tokens),
+               '--trials', str(args.trials), '--threads', str(cfg.get('threads', 12)),
+               '--gpu-budget-mib', str(cfg['gpu_budget_mib'])]
+    if cfg.get('record_prefill_logits'):
+        command += ['--dump-prefill', str(args.output.with_suffix('.prefill.logits.bin').resolve())]
+    if cfg.get('stop_ids'):
+        command += ['--stop-ids', ','.join(map(str, cfg['stop_ids']))]
+    return command
 
 
 def eval_complete(rows, counts):
@@ -334,6 +362,8 @@ def worker(args):
     if not args.single and not args.eval_corpus and cfg.get("speculative") == "external":
         command += ["--speculative=external", "--draft-depth=" + str(cfg.get("draft_depth", 2)),
                     "--draft-worker-config=" + str(Path(cfg["draft_worker_config"]).resolve())]
+    if cfg.get('backend') == 'vulkan':
+        command = vulkan_command(cfg, args)
     group = Path("/sys/fs/cgroup" + Path("/proc/self/cgroup").read_text().strip().split(":")[-1])
     before = group_stats(group)
     if before["memory.max"] != args.ram_gib * 2**30 or before["memory.swap.max"] != 0:
@@ -352,8 +382,8 @@ def worker(args):
     record["peak_process_gpu_mib"] = 0
     record["gpu_physical_reserve_mib"] = int(env.get("STRATA_GLM_GPU_RESERVE_MIB", "512"))
     record["gpu_backend"] = cfg.get("backend", "cuda")
-    record["gpu_process_accounting"] = "unavailable; global AMD sysfs" if record["gpu_backend"] == "hip" else "NVIDIA process query"
-    if record["gpu_backend"] == "hip":
+    record["gpu_process_accounting"] = "unavailable; global AMD sysfs" if record["gpu_backend"] in ("hip", "vulkan") else "NVIDIA process query"
+    if record["gpu_backend"] in ("hip", "vulkan"):
         record["peak_process_gpu_mib"] = None
     _, initial_gpu = read_gpu(cfg)
     record["gpu_initial_snapshot"] = initial_gpu
@@ -363,7 +393,7 @@ def worker(args):
         record["gpu_physical_reserve_mib"], args.gpu_used_limit_mib, initial_gpu["reserved_mib"])
     record["gpu_allocation_budget_mib"] = cfg["gpu_budget_mib"]
     record["gpu_requested_used_limit_mib"] = args.gpu_used_limit_mib
-    record["peak_background_gpu_mib"] = None if record["gpu_backend"] == "hip" else 0
+    record["peak_background_gpu_mib"] = None if record["gpu_backend"] in ("hip", "vulkan") else 0
     record["minimum_gpu_free_mib"] = initial_gpu["free_mib"]
     with args.output.with_suffix(".stdout").open("w") as out, args.output.with_suffix(".log").open("w") as err:
         proc = subprocess.Popen(command, stdout=out, stderr=err, env=env, start_new_session=True)

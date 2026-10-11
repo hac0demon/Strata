@@ -6347,6 +6347,9 @@ class Decoder {
         pipelining = false;
         if (pipeline_ready(nt)) prepare_step_mailbox();
         pipelining = pipeline_ready(nt);
+        if (const char *trace_dir = std::getenv("STRATA_GLM_STATE_TRACE_DIR");
+            trace_dir && *trace_dir && position == 0 && nt == 1 && pipelining)
+            throw std::invalid_argument("GLM: layer-state trace requires non-pipelined sequential execution");
         if (exact_cache && !pipelining) throw std::runtime_error("GLM: exact cache requires pipelined decode");
         PipelineGuard pipeline_guard{*this};
         pipeline_residents = false;
@@ -6587,6 +6590,17 @@ class Decoder {
                           << std::chrono::duration<double, std::milli>(mixer_end - layer_start).count()
                           << " ffn_ms=" << std::chrono::duration<double, std::milli>(end - mixer_end).count()
                           << '\n';
+            }
+            if (const char *directory = std::getenv("STRATA_GLM_STATE_TRACE_DIR");
+                directory && *directory && position == 0 && nt == 1) {
+                check(cudaStreamSynchronize(stream));
+                const auto values = r.floats(4 * m.hidden);
+                const auto path = std::filesystem::path(directory) / ("layer-" + std::to_string(l) + ".bin");
+                std::filesystem::create_directories(path.parent_path());
+                if (std::filesystem::exists(path)) throw std::runtime_error("GLM: refusing to overwrite layer trace");
+                std::ofstream out(path, std::ios::binary);
+                out.write((const char *)values.data(), values.size() * sizeof(float));
+                if (!out) throw std::runtime_error("GLM: layer trace write failed");
             }
         }
         flush_deferred(nullptr);
