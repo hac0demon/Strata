@@ -101,6 +101,7 @@ def add_config_args(ap, sweep=False):
     opt("--affinity", "affinity")
     opt("--gpu-budget-mib", "gpu_budget_mib")
     opt("--reserve-mib", "reserve_mib")
+    opt("--tier-owned-reserve", "tier_owned_reserve", help="1 = use the engine's reduced owned-tier fill reserve")
     opt("--prefill-scratch-mib", "prefill_scratch_mib")
     opt("--prefill-chunk", "prefill_chunk")
     opt("--prefetch-groups", "prefetch_groups")
@@ -173,6 +174,8 @@ def load_trace(args):
 
 
 def fmt_table(rows, columns):
+    if not rows:
+        return "  ".join(columns) + "\n(no candidates)"
     widths = [max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in columns]
     lines = ["  ".join(c.ljust(w) for c, w in zip(columns, widths))]
     lines.append("  ".join("-" * w for w in widths))
@@ -316,6 +319,40 @@ def check_implemented_config(cfg):
                          "; use --hypothetical without --implemented-only to explore them")
 
 
+def node_from_arg(text):
+    if text in hwmod.PRESETS:
+        return hwmod.PRESETS[text]()
+    return hwmod.from_dict(json.loads(pathlib.Path(text).read_text()))
+
+
+def multinode(args):
+    import multinode as mn
+    if not 2 <= len(args.node) <= 4:
+        raise SystemExit("--node: give the decoder node and 1 to 3 worker nodes")
+    hw = node_from_arg(args.node[0])
+    for item in args.set:
+        key, value = item.split("=", 1)
+        hw.set(key, value)
+    links = list(args.link) + ["ib"] * (len(args.node) - 1 - len(args.link))
+    workers = [hwmod.worker_from_hardware(node_from_arg(n), hwmod.parse_link(l), args.worker_threads or None)
+               for n, l in zip(args.node[1:], links)]
+    params = params_from_args(args)
+    cfg = config_from_args(args)
+    output = {}
+    for mode in (["row", "expert"] if args.split == "both" else [args.split]):
+        rows, base = mn.search(hw, workers, cfg, params, mode, args.top)
+        print(mn.describe(rows, base, hw, workers, mode))
+        print()
+        output[mode] = dict(single_node_tok_s=base.tok_s, candidates=[
+            dict(shares=list(r["shares"]), decode_tok_s=r["decode"], gain=r["gain"], bottleneck=r["bottleneck"],
+                 remote_ms=r["remote_ms"], local_gib=r["local_gib"], worker_gib=r["worker_gib"], shipping_s=r["shipping_s"], notes=r["notes"])
+            for r in rows])
+    if args.output:
+        pathlib.Path(args.output).write_text(json.dumps(dict(decoder=hw.to_dict(), workers=[dataclasses.asdict(w) for w in workers],
+                                                             config=dataclasses.asdict(cfg), results=output), indent=1) + "\n")
+    return 0
+
+
 def plan(args):
     hw = hardware_from_args(args)
     params = params_from_args(args)
@@ -426,6 +463,15 @@ def show_hw(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # `--model glm53` (anywhere on the line) switches geometry, fixed weights and packs before the parsers are built.
+    chosen = "flash"
+    if "--model" in argv:
+        i = argv.index("--model"); chosen = argv[i + 1]; del argv[i:i + 2]
+    if chosen not in model.MODELS:
+        raise SystemExit(f"--model: choose from {', '.join(model.MODELS)}")
+    if chosen != model.ACTIVE_MODEL:
+        model.use_model(chosen)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
 
@@ -461,6 +507,18 @@ def main(argv=None):
     p.add_argument("--top", type=int, default=15)
     p.add_argument("--output")
     p.set_defaults(func=plan)
+
+    p = sub.add_parser("multinode", help="best split of the routed expert work across up to 4 nodes (decoder + workers)")
+    p.add_argument("--node", action="append", required=True, metavar="PRESET|JSON",
+                   help="first = decoder node (needs the GPU), then up to 3 workers; a preset name or a hardware JSON file")
+    p.add_argument("--link", action="append", default=[], metavar="ib|ib-qdr|gbe|10gbe|rtt_us,gbps,exposed_us",
+                   help="one per worker, in order (default: ib for all)")
+    p.add_argument("--worker-threads", type=int, default=0, help="threads on every worker (default: its cores minus the reserve)")
+    p.add_argument("--split", choices=["row", "expert", "both"], default="row")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE", help="patch the decoder node, e.g. memory.dram_gbps=90")
+    p.add_argument("--params", default=None); p.add_argument("--param", action="append", default=[], metavar="NAME=VALUE")
+    add_config_args(p); p.add_argument("--top", type=int, default=8); p.add_argument("--output")
+    p.set_defaults(func=multinode)
 
     p = sub.add_parser("hw", help="print a hardware preset as JSON")
     add_hw_args(p)

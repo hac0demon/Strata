@@ -13,6 +13,7 @@ class Params:
     cpu_width_penalty: float = 0.04    # bandwidth lost per extra token of width (multi-token kernel overhead)
     cpu_layer_overhead_ms: float = 0.12  # pool phase barriers, quantization, job build per MoE layer
     cpu_quant_scale: float = 1.0       # scales the per-core quantized-dot throughput
+    expert_split_imbalance: float = 0.35  # multinode expert-index split: expected max/mean load excess ~ c/sqrt(top_k*share)
     gpu_width_factor: float = 0.185    # dense GEMV cost grows by this per extra column up to 4
     gpu_width_factor_tail: float = 0.30
     gpu_kernels_per_layer: int = 44    # about 1987 launches per token over 45 layers
