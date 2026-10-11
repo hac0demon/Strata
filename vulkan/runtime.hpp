@@ -39,6 +39,14 @@ public:
   void kda(int layer, std::span<const float> q, std::span<const float> k,
            std::span<const float> v, std::span<const float> g,
            std::span<const float> beta, std::span<float> y, int heads, int dim);
+  void kda_fused(int layer, std::span<const float> raw_qkv,
+                 std::span<const float> decay, std::span<const float> beta,
+                 std::span<const float> gate,
+                 std::span<const float> conv_weights,
+                 std::span<const float> bias, std::span<const float> negative_a,
+                 std::span<const float> norm, std::span<float> output,
+                 int heads, int kernel_size, float lower, float eps);
+  std::vector<float> kda_history(int layer) const;
   void mla(int layer, std::span<const float> row, int position, int capacity,
            std::span<const float> q, std::span<const int> ids,
            std::span<float> y, int heads, float scale);
@@ -67,7 +75,7 @@ private:
   std::string name_;
   std::map<std::string, Kernel> kernels_;
   std::array<std::unique_ptr<Buffer>, 8> scratch_;
-  std::map<int, std::unique_ptr<Buffer>> state_, cache_;
+  std::map<int, std::unique_ptr<Buffer>> state_, cache_, conv_, kda_weights_;
   std::map<int, int> positions_;
   void dispatch(const std::string &, const std::array<Buffer *, 8> &,
                 const void *, uint32_t);

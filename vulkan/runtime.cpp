@@ -1,10 +1,12 @@
 #include "runtime.hpp"
+#include "kda_fused_spv.hpp"
 #include "kda_spv.hpp"
 #include "mhc_spv.hpp"
 #include "mla_spv.hpp"
 #include "task_trace.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -201,6 +203,8 @@ Compute::Compute(std::string requested, size_t budget) : budget_(budget) {
 }
 Compute::~Compute() { cleanup(); }
 void Compute::cleanup() noexcept {
+  conv_.clear();
+  kda_weights_.clear();
   state_.clear();
   cache_.clear();
   for (auto &b : scratch_)
@@ -244,6 +248,8 @@ Compute::Kernel &Compute::kernel(const std::string &name) {
     std::span<const unsigned char> bytes;
     if (name == "kda")
       bytes = kda_spv;
+    else if (name == "kda_fused")
+      bytes = kda_fused_spv;
     else if (name == "mla")
       bytes = mla_spv;
     else if (name == "mhc")
@@ -402,6 +408,69 @@ void Compute::kda(int layer, std::span<const float> q,
   dispatch("kda", b, params.data(), heads);
   b[6]->get(y.data(), y.size_bytes());
 }
+void Compute::kda_fused(int layer, std::span<const float> raw,
+                        std::span<const float> decay,
+                        std::span<const float> beta,
+                        std::span<const float> gate,
+                        std::span<const float> weights,
+                        std::span<const float> bias, std::span<const float> a,
+                        std::span<const float> norm, std::span<float> y,
+                        int heads, int kernel_size, float lower, float eps) {
+  require(layer >= 0 && heads > 0 && heads <= 256 && kernel_size >= 1 &&
+              kernel_size <= 32 && std::isfinite(lower) && lower <= 0 &&
+              std::isfinite(eps) && eps > 0,
+          "Vulkan fused KDA dimensions invalid");
+  const size_t n = size_t(heads) * 128;
+  require(raw.size() == 3 * n && decay.size() == n &&
+              beta.size() == size_t(heads) && gate.size() == n &&
+              weights.size() == 3 * n * kernel_size && bias.size() == n &&
+              a.size() == size_t(heads) && norm.size() == 128 && y.size() == n,
+          "Vulkan fused KDA buffer geometry invalid");
+  auto &state = state_[layer];
+  if (!state)
+    state = std::make_unique<Buffer>(*this, n * 128 * sizeof(float), true);
+  auto &history = conv_[layer];
+  const size_t history_bytes =
+      std::max(size_t(1), 3 * n * (kernel_size - 1)) * sizeof(float);
+  if (!history)
+    history = std::make_unique<Buffer>(*this, history_bytes, true);
+  auto &params = kda_weights_[layer];
+  const size_t params_bytes =
+      (weights.size() + bias.size() + a.size() + norm.size()) * sizeof(float);
+  if (!params) {
+    std::vector<float> packed;
+    packed.reserve(params_bytes / sizeof(float));
+    for (auto input : {weights, bias, a, norm})
+      packed.insert(packed.end(), input.begin(), input.end());
+    params = std::make_unique<Buffer>(*this, params_bytes, true);
+    params->put(packed.data(), params_bytes);
+  }
+  require(state->size == n * 128 * sizeof(float) &&
+              history->size == history_bytes && params->size == params_bytes,
+          "Vulkan fused KDA cached geometry changed");
+  std::array<Buffer *, 8> b{};
+  b[0] = state.get();
+  b[5] = params.get();
+  b[7] = history.get();
+  std::array<std::span<const float>, 4> inputs{raw, decay, beta, gate};
+  for (int i = 0; i < 4; ++i) {
+    b[i + 1] = &scratch(i + 1, inputs[i].size_bytes());
+    b[i + 1]->put(inputs[i].data(), inputs[i].size_bytes());
+  }
+  b[6] = &scratch(6, y.size_bytes());
+  struct {
+    uint32_t heads, kernel;
+    float lower, eps;
+  } push{uint32_t(heads), uint32_t(kernel_size), lower, eps};
+  dispatch("kda_fused", b, &push, heads);
+  b[6]->get(y.data(), y.size_bytes());
+}
+std::vector<float> Compute::kda_history(int layer) const {
+  const auto &b = *conv_.at(layer);
+  std::vector<float> out(b.size / sizeof(float));
+  b.get(out.data(), b.size);
+  return out;
+}
 void Compute::mla(int layer, std::span<const float> row, int position,
                   int capacity, std::span<const float> q,
                   std::span<const int> ids, std::span<float> y, int heads,
@@ -496,6 +565,8 @@ std::vector<float> Compute::kda_state(int layer) const {
   return out;
 }
 void Compute::reset() {
+  for (auto &[i, b] : conv_)
+    std::memset(b->mapped, 0, b->size);
   for (auto &[i, b] : state_)
     std::memset(b->mapped, 0, b->size);
   for (auto &[i, b] : cache_)

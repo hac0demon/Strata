@@ -1,5 +1,6 @@
 // Experimental Vulkan GLM-5.3f runner: GPU projections/mHC/KDA/MLA, existing
 // CPU routed experts.
+#include "cpu_executor.hpp"
 #include "model_checks.hpp"
 #include "projections.hpp"
 #include "runtime.hpp"
@@ -12,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <ggml.h>
 #include <iostream>
 #include <numeric>
@@ -81,11 +83,16 @@ class Decoder {
   strata::vulkan::Projections projections_;
   strata::vulkan::Compute compute_;
   cpu::ExpertPool pool_;
+  std::unique_ptr<strata::vulkan::CpuExecutor> executor_;
+  cpu::ThreadAffinity gpu_affinity_;
   int capacity_, position_ = 0;
+  bool overlap_experts_ = false, cpu_mhc_ = false, joined_projections_ = false;
+  double cpu_expert_ms_ = 0;
+  bool phased_experts_ = false, fused_kda_ = false;
   std::map<std::string, Vec> scalars_;
   struct State {
     std::array<Vec, 3> conv;
-    Vec keys, gates, pooled;
+    Vec keys, gates, pooled, fused_weights;
   };
   std::vector<State> states_;
   const Vec &scalar(const std::string &name) {
@@ -102,6 +109,25 @@ class Decoder {
   Vec mat(const std::string &name, std::span<const float> x, int heads = 1) {
     return projections_.mat(name, artifact_.at(name), x, heads);
   }
+  std::vector<Vec> mats(const std::vector<std::string> &names, const Vec &x) {
+    std::vector<std::pair<std::string, const strata::core::ArtifactTensor *>>
+        items;
+    for (const auto &name : names)
+      items.emplace_back(name, &artifact_.at(name));
+    if (joined_projections_)
+      return projections_.joined(items, x);
+    std::vector<Vec> results;
+    for (const auto &name : names)
+      results.push_back(mat(name, x));
+    return results;
+  }
+  std::vector<Vec> low_gates(const std::string &p, const Vec &f, const Vec &g) {
+    const std::string fn = p + "ssm_f_b.weight", gn = p + "ssm_g_b.weight";
+    if (joined_projections_)
+      return projections_.multiple(
+          {{fn, &artifact_.at(fn)}, {gn, &artifact_.at(gn)}}, {f, g});
+    return {mat(fn, f), mat(gn, g)};
+  }
   Vec normalize(const std::string &name, std::span<const float> x) {
     return norm(x, scalar(name), m_.rms_epsilon);
   }
@@ -110,18 +136,43 @@ class Decoder {
     auto normalized = norm(r, {}, m_.rms_epsilon);
     auto projected = mat(p + "hc_" + kind + "_fn.weight", normalized);
     Vec c(24), x(m_.hidden);
-    compute_.mhc_read(r, projected, scalar(p + "hc_" + kind + "_base.weight"),
-                      scalar(p + "hc_" + kind + "_scale.weight"), c, x,
-                      m_.sinkhorn_iterations, m_.hc_epsilon);
+    if (cpu_mhc_) {
+      ref::mhc(projected.data(),
+               scalar(p + "hc_" + kind + "_base.weight").data(),
+               scalar(p + "hc_" + kind + "_scale.weight").data(), c.data(),
+               m_.sinkhorn_iterations, m_.hc_epsilon);
+      for (int d = 0; d < m_.hidden; ++d)
+        for (int i = 0; i < 4; ++i)
+          x[d] += c[i] * r[i * m_.hidden + d];
+    } else {
+      compute_.mhc_read(r, projected, scalar(p + "hc_" + kind + "_base.weight"),
+                        scalar(p + "hc_" + kind + "_scale.weight"), c, x,
+                        m_.sinkhorn_iterations, m_.hc_epsilon);
+    }
     return {std::move(x), std::move(c)};
   }
   void write(Vec &r, const Vec &c, const Vec &y) {
-    compute_.mhc_write(r, c, y, r);
+    if (cpu_mhc_) {
+      Vec out(r.size());
+      for (int j = 0; j < 4; ++j)
+        for (int d = 0; d < m_.hidden; ++d) {
+          float value = c[4 + j] * y[d];
+          for (int i = 0; i < 4; ++i)
+            value += c[8 + i * 4 + j] * r[i * m_.hidden + d];
+          out[j * m_.hidden + d] = value;
+        }
+      r.swap(out);
+    } else {
+      compute_.mhc_write(r, c, y, r);
+    }
   }
   Vec ffn(const std::string &p, const Vec &x, const std::string &suffix,
           float limit) {
-    auto g = mat(p + "ffn_gate" + suffix + ".weight", x),
-         u = mat(p + "ffn_up" + suffix + ".weight", x);
+    auto gu = mats({p + "ffn_gate" + suffix + ".weight",
+                    p + "ffn_up" + suffix + ".weight"},
+                   x);
+    auto &g = gu[0];
+    auto &u = gu[1];
     if (g.size() != u.size())
       throw std::runtime_error("Vulkan FFN geometry differs");
     for (size_t i = 0; i < g.size(); i++)
@@ -133,8 +184,34 @@ class Decoder {
     auto &s = states_[layer];
     std::array<Vec, 3> qkv;
     const std::array<std::string, 3> parts{"q", "k", "v"};
+    auto qk = mats({p + "attn_q.weight", p + "attn_k.weight",
+                    p + "attn_v.weight", p + "ssm_f_a.weight",
+                    p + "ssm_g_a.weight", p + "ssm_beta.weight"},
+                   x);
+    if (fused_kda_) {
+      Vec raw(3 * n);
+      for (int part = 0; part < 3; ++part) {
+        std::copy(qk[part].begin(), qk[part].end(),
+                  raw.begin() + size_t(part) * n);
+      }
+      if (s.fused_weights.empty())
+        for (const auto &part : parts) {
+          const auto &weight = scalar(p + "ssm_conv1d_" + part + ".weight");
+          s.fused_weights.insert(s.fused_weights.end(), weight.begin(),
+                                 weight.end());
+        }
+      auto fg = low_gates(p, qk[3], qk[4]);
+      auto &decay = fg[0];
+      auto &gate = fg[1];
+      Vec y(n);
+      compute_.kda_fused(layer, raw, decay, qk[5], gate, s.fused_weights,
+                         scalar(p + "ssm_dt.bias"), scalar(p + "ssm_a"),
+                         scalar(p + "ssm_norm.weight"), y, m_.linear_heads,
+                         m_.conv_kernel, m_.gate_lower_bound, m_.rms_epsilon);
+      return mat(p + "attn_output.weight", y);
+    }
     for (int part = 0; part < 3; part++) {
-      auto raw = mat(p + "attn_" + parts[part] + ".weight", x);
+      const auto &raw = qk[part];
       if (raw.size() != size_t(n))
         throw std::runtime_error("Vulkan KDA projection geometry differs");
       const auto &w = scalar(p + "ssm_conv1d_" + parts[part] + ".weight");
@@ -153,18 +230,18 @@ class Decoder {
         qkv[part][i] = sum * ref::sigmoid(sum);
       }
     }
-    auto low = mat(p + "ssm_f_a.weight", x);
+    auto low = std::move(qk[3]);
     auto decay = mat(p + "ssm_f_b.weight", low);
     const auto &bias = scalar(p + "ssm_dt.bias");
     const auto &a = scalar(p + "ssm_a");
     for (int i = 0; i < n; i++)
       decay[i] = m_.gate_lower_bound *
                  ref::sigmoid(-a[i / m_.linear_dim] * (decay[i] + bias[i]));
-    auto beta = mat(p + "ssm_beta.weight", x);
+    auto beta = std::move(qk[5]);
     Vec y(n);
     compute_.kda(layer, qkv[0], qkv[1], qkv[2], decay, beta, y, m_.linear_heads,
                  m_.linear_dim);
-    low = mat(p + "ssm_g_a.weight", x);
+    low = std::move(qk[4]);
     auto gate = mat(p + "ssm_g_b.weight", low);
     const auto &w = scalar(p + "ssm_norm.weight");
     for (int h = 0; h < m_.linear_heads; h++) {
@@ -180,15 +257,17 @@ class Decoder {
     return mat(p + "attn_output.weight", y);
   }
   Vec mla(const std::string &p, int layer, const Vec &x) {
-    auto low = mat(p + "attn_q_a.weight", x),
-         qr = normalize(p + "attn_q_a_norm.weight", low),
-         q = mat(p + "attn_q_b.weight", qr);
-    auto raw = mat(p + "attn_kv_a_mqa.weight", x),
-         row = normalize(p + "attn_kv_a_norm.weight", raw);
-    auto iq = mat(p + "indexer.attn_q_b.weight", qr),
-         iw = mat(p + "indexer.proj.weight", x),
-         ik = mat(p + "indexer.attn_k.weight", x),
-         gate = mat(p + "indexer_compressor_gate.weight", x);
+    auto initial = mats({p + "attn_q_a.weight", p + "attn_kv_a_mqa.weight",
+                         p + "indexer.proj.weight", p + "indexer.attn_k.weight",
+                         p + "indexer_compressor_gate.weight"},
+                        x);
+    auto qr = normalize(p + "attn_q_a_norm.weight", initial[0]);
+    auto queries =
+        mats({p + "attn_q_b.weight", p + "indexer.attn_q_b.weight"}, qr);
+    auto q = std::move(queries[0]), iq = std::move(queries[1]);
+    auto row = normalize(p + "attn_kv_a_norm.weight", initial[1]);
+    auto iw = std::move(initial[2]), ik = std::move(initial[3]),
+         gate = std::move(initial[4]);
     auto &s = states_[layer];
     const int dim = m_.index_dim, pool = m_.index_pool, tokens = position_ + 1,
               pools = tokens / pool, tail = position_ % pool;
@@ -276,9 +355,38 @@ class Decoder {
       j.nact[0] = act.data();
       j.out[0] = results.data() + i * m_.hidden;
     }
-    pool_.run_layer_native(format, jobs.data(), jobs.size(), results.data(),
-                           routing.data(), sum.data(), 1, m_.top_k);
-    auto shared = ffn(p, x, "_shexp", desc.shared_swiglu_limit);
+    auto routed = [&] {
+      const auto started = Clock::now();
+      if (phased_experts_) {
+        pool_.run_split_multi_native(format, jobs.data(), jobs.size());
+        pool_.reduce_routed(results.data(), routing.data(), sum.data(), 1,
+                            m_.top_k, m_.hidden, format.canon);
+      } else {
+        pool_.run_layer_native(format, jobs.data(), jobs.size(), results.data(),
+                               routing.data(), sum.data(), 1, m_.top_k);
+      }
+      cpu_expert_ms_ +=
+          std::chrono::duration<double, std::milli>(Clock::now() - started)
+              .count();
+    };
+    Vec shared;
+    if (overlap_experts_) {
+      // Only the main thread owns Vulkan. The worker uses layer-local CPU
+      // storage, which stays alive until get(), also during exception unwind.
+      auto pending = executor_ ? executor_->submit(routed)
+                               : std::async(std::launch::async, routed);
+      try {
+        shared = ffn(p, x, "_shexp", desc.shared_swiglu_limit);
+      } catch (...) {
+        // Persistent tasks need an explicit join on exceptional GPU paths too.
+        pending.wait();
+        throw;
+      }
+      pending.get();
+    } else {
+      routed();
+      shared = ffn(p, x, "_shexp", desc.shared_swiglu_limit);
+    }
     for (size_t i = 0; i < sum.size(); i++)
       sum[i] += shared[i];
     return sum;
@@ -308,10 +416,47 @@ public:
                                  m_.index_dim);
       }
     }
+    const char *fused = std::getenv("STRATA_VULKAN_FUSED_KDA");
+    fused_kda_ = fused && std::string(fused) == "1";
+    const char *placement = std::getenv("STRATA_VULKAN_CPU_PLACEMENT");
+    if (placement && std::string(placement) != "split" &&
+        std::string(placement) != "default")
+      throw std::invalid_argument(
+          "Vulkan CPU placement must be split or default");
+    if (placement && std::string(placement) == "split") {
+      const auto topology =
+          cpu::detect_cpu_topology(true, cpu::PoolAffinity::All);
+      if (topology.host_core < 0 ||
+          topology.worker_cores.size() <= size_t(pool_.workers()))
+        throw std::invalid_argument(
+            "Vulkan split placement needs a spare physical core");
+      executor_ =
+          std::make_unique<strata::vulkan::CpuExecutor>(topology.host_core);
+      const int gpu_cpu = topology.worker_cores.back();
+      gpu_affinity_ = cpu::pin_current_thread(gpu_cpu);
+      std::cerr << "VULKAN_CPU_PLACEMENT expert_host=" << topology.host_core
+                << " gpu_host=" << gpu_cpu << " persistent=1\n";
+    }
+    const char *schedule = std::getenv("STRATA_VULKAN_EXPERT_SCHEDULE");
+    if (schedule && std::string(schedule) != "phased" &&
+        std::string(schedule) != "flow")
+      throw std::invalid_argument(
+          "Vulkan expert schedule must be phased or flow");
+    phased_experts_ = schedule && std::string(schedule) == "phased";
+    const char *overlap = std::getenv("STRATA_VULKAN_OVERLAP_EXPERTS");
+    overlap_experts_ = overlap && std::string(overlap) == "1";
+    const char *mhc = std::getenv("STRATA_VULKAN_CPU_MHC");
+    cpu_mhc_ = mhc && std::string(mhc) == "1";
+    const char *joined = std::getenv("STRATA_VULKAN_JOINED_PROJECTIONS");
+    joined_projections_ = joined && std::string(joined) == "1";
     std::cerr
         << "VULKAN_MODEL layers=" << m_.layers.size() << " hidden=" << m_.hidden
         << " experts=" << m_.experts << " cpu_workers=" << pool_.workers()
         << " expert_cache_slots=0 prefill=sequential speculative=unsupported\n";
+  }
+  ~Decoder() {
+    executor_.reset();
+    cpu::restore_thread_affinity(gpu_affinity_);
   }
   int vocabulary() const { return m_.vocab; }
   int position() const { return position_; }
@@ -391,9 +536,11 @@ public:
   }
   void report() {
     std::cerr << "VULKAN_WORK projection_calls=" << projections_.calls
+              << " projection_submissions=" << projections_.submissions
               << " projection_compute_ms=" << projections_.compute_ms
               << " projection_transfer_ms=" << projections_.transfer_ms
               << " affine_cpu_ms=" << projections_.affine_cpu_ms
+              << " cpu_expert_ms=" << cpu_expert_ms_
               << " custom_dispatch_ms=" << compute_.dispatch_ms
               << " projection_resident_MiB="
               << projections_.resident_bytes() / 1048576.0

@@ -128,3 +128,100 @@ Vulkan engine traces also bracket each named projection and custom shader with
 its context position and layer. A failed GPU fence exits without freeing
 in-flight buffers. Read the last persisted operation after a reboot using the
 diagnostic status tool; an interrupted run is never a passing measurement.
+
+
+## Opt-in decode profile measured on October 12
+
+The later five-trial comparison on the same 3950X in 65 W ECO mode,
+64 GiB DDR4-2666 and RX 9070 XT reached the 80% decode target:
+
+| Backend | Workers | Sequential prefill tok/s | Decode tok/s | Sampled peak global VRAM MiB |
+| --- | ---: | ---: | ---: | ---: |
+| ROCm 10.1 control | 12 | 8.643 | 8.530 | 6,723 |
+| Vulkan fast profile | 12 | 7.000 | 6.972 | 5,517 |
+
+The Vulkan median is 81.7% of the matched ROCm median, and 1.86 times the
+previous 3.739 tok/s Vulkan result. All four warm Vulkan decode trials were
+above 80% of the control; the cold first decode was much slower. Both runs used
+the frozen 32-token prompt, 64 generated tokens per trial, five trials, one
+untimed prefill warmup, no expert tier and the same RAM/VRAM limits. Reported
+medians include the cold first decode. All 320 generated IDs matched. These
+numbers describe the sequential, CPU-expert control, not a tuned ROCm GPU tier.
+The [optimization record](benchmarks/glm_vulkan_optimization_9070xt_20261012.json)
+contains individual timings, source/build hashes, quality results and failures.
+
+Use the separate
+[fast config](../configs/experimental/glm53f-reap50-vulkan-fast-64g-16g.json).
+The original Vulkan config and CUDA/HIP defaults keep their existing settings.
+The profile enables these options explicitly:
+
+- `STRATA_VULKAN_ASYNC_STAGING=1`: reusable pinned upload/download storage,
+  followed by one synchronization after queued transfers and graph execution.
+  Pending transfers are synchronized before storage is freed on an exception.
+- `STRATA_VULKAN_JOINED_PROJECTIONS=1`: persistent graphs for independent
+  KDA/MLA projections and FFN gate/up pairs, including distinct low-rank inputs.
+  Shared inputs are uploaded once. Original-sum affine formats use individual
+  products so their correction remains in place.
+- `STRATA_VULKAN_OVERLAP_EXPERTS=1` and
+  `STRATA_VULKAN_CPU_PLACEMENT=split`: CPU routed experts overlap the shared
+  expert on Vulkan. A persistent coordinator owns the reserved host core,
+  and GPU submission uses an unused physical core. This requires a spare core.
+  GPU work stays on the submitting thread; captured CPU storage is joined on
+  success and exception paths.
+- `STRATA_VULKAN_CPU_MHC=1`: mHC coefficients/read/write use the existing CPU
+  reference instead of transferring residual vectors for a small dispatch.
+- `STRATA_VULKAN_FUSED_KDA=1`: one shader performs convolution/history updates,
+  decay/beta gates, the recurrence, output RMS normalization and the output gate.
+  Per-head normalization and decay calculations are shared across columns.
+- `STRATA_VULKAN_AVX2_ACTIVATIONS=1`: vectorized Q8_1 activation reconstruction,
+  preserving scalar rounding, scale storage, clipping and negative zero.
+  This requires a native-host build on an AVX2 CPU.
+- `GGML_VK_ALLOW_GRAPHICS_QUEUE=1`: GGML's existing queue option also keeps
+  transfers on the compute queue on this RADV card, avoiding cross-queue waits.
+  `GGML_VK_DISABLE_INTEGER_DOT_PRODUCT=1` remains set in the measured profile.
+
+The tested fast executable was built with:
+
+```sh
+cmake -S . -B build-vulkan-native \
+  -DSTRATA_ENABLE_VULKAN=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF \
+  -DSTRATA_BUILD_TESTS=OFF -DSTRATA_VULKAN_NATIVE_HOST=ON \
+  -DSTRATA_VULKAN_NATIVE_DOTS=ON \
+  -DSTRATA_GGML_DIR=/path/to/pinned/llama.cpp \
+  -DVulkan_GLSLC_EXECUTABLE=/path/to/glslc \
+  -DCMAKE_PREFIX_PATH=/path/to/vulkan/development/prefix
+cmake --build build-vulkan-native --target strata-glm-vulkan \
+  glm_vulkan_parity glm_vulkan_executor_check -j 8
+build-vulkan-native/vulkan/glm_vulkan_executor_check
+```
+
+`STRATA_VULKAN_NATIVE_HOST` uses native CPU instructions with floating-point
+contraction disabled and finite checks retained; it does not create a portable
+CPU binary. The tested compiler was
+[shaderc v2026.3](https://github.com/google/shaderc/tree/v2026.3), commit
+`2c8cae778eec0283b44acbe7ed1a386865d78799`, built with its pinned dependencies.
+Both advertised upstream Linux binary artifacts returned HTTP 404, so the
+compiler was built in workspace scratch without installing system packages.
+
+`STRATA_VULKAN_NATIVE_DOTS` patches a build-local copy of the pinned GGML vector
+shaders; it preserves the supplied checkout. It removes rounded half sums from
+Q4_K/Q5_K minima and leaves Q4_0/Q5_0 original-input-sum correction to the host.
+The unpatched integer path failed the unchanged primitive accuracy gate; the
+patch passed. Integer dots are nevertheless disabled in the measured fast
+profile. This option is independent of native host compilation.
+
+For GPU parity, set `STRATA_VULKAN_ASYNC_STAGING=1` and
+`STRATA_VULKAN_AVX2_ACTIVATIONS=1`, then run
+`glm_vulkan_parity /path/to/model.gguf` under the guarded GPU precheck. The model
+argument additionally checks grouped projections with shared/distinct inputs.
+Fused KDA checks cover five recurrent steps, convolution lengths one and four,
+state/output/history and reset. Existing `2e-5` limits remain unchanged.
+The CPU-only coordinator check covers exception propagation and joining queued
+work before captured storage is released.
+
+The final prefill KL is still 0.058, above the unchanged 0.01 gate. Matching
+greedy IDs does not establish distribution equivalence, and the short coding
+oracle does not replace held-out coding or perplexity tests. Keep the profile
+experimental. No GPU/PCI hardware fault was recorded during the optimization
+campaign. Older AMD GPUs, CUDA execution, SYCL builds, batched prefill and
+speculative decoding were not tested.
