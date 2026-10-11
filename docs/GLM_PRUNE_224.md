@@ -32,12 +32,32 @@ original UD-Q2_K_XL logits (perplexity 8.57 on this set).
 
 | Model | File | Perplexity | KL | Top-1 |
 |---|---:|---:|---:|---:|
-| Q23, 288 experts (unpruned) | 120.9 GB | pending | pending | pending |
 | **Q23, 224 experts** | **95.5 GB** | **8.966 (+4.6% vs original)** | **0.191** | **82.1%** |
 | Q22, 224 experts | 88.1 GB | 9.049 (+5.6%) | 0.216 | 80.8% |
 | REAP-50 Q23, 144 experts (third-party prune) | 63.2 GB | 11.12 (+29.8%) | 0.587 | 69.8% |
 
-Decode speed: not measured yet. The simulator (`tools/sim`, packs `reap224_q23` / `reap224_q22`) predicts no change
+The unpruned Q23 run (120.9 GB) was stopped by the run guard's memory limit after 58 of the 64 sequences (peak
+RSS 116.9 GB on this 125 GB host). On those same 58 sequences, the cost of pruning is:
+
+| Model (first 58 sequences) | Perplexity | KL | Top-1 |
+|---|---:|---:|---:|
+| Q23, 288 experts | 8.678 | 0.159 | 83.6% |
+| Q23, 224 experts | 8.804 (+1.5%) | 0.191 (+0.033) | 82.3% (−1.3 pp) |
+| Q22, 224 experts | 8.885 (+2.4%) | 0.217 (+0.058) | 81.1% (−2.4 pp) |
+
+Speed, **indicative only** (2026-10-12, measured while another agent's builds and tests used the CPU and GPU, so
+the quiet-run guard's interference rejection was disabled; qualified profile: release decoder, affinity 0.08, MTP
+depth 1, 512 tokens x 3; staged prefetch off in every arm because it currently requires exactly 288 experts):
+
+| Model | Decode, 8K held-out code (tok/s) | Prefill 8K, single pass (tok/s) | Decode, 2K (tok/s) | Prefill 2K (tok/s) |
+|---|---|---:|---|---:|
+| Q23, 288 experts | 18.6 / 13.1 / 16.6 | 278 | (run rejected: outside GPU job) | — |
+| Q23, 224 experts | 18.7 / 18.8 / 19.1 | 311 | 18.1 / 18.5 / 9.8 | 114 |
+| Q22, 224 experts | 19.8 / 20.1 / 20.1 | 310 | 19.8 / 19.0 / 19.1 | 136 |
+
+Pruning did not slow decode; the 288-expert file, which nearly fills the 125 GB host (it touched swap), was the
+least steady. A clean comparison on a quiet machine is still needed (the clean qualified number for the unpruned
+file is 23.0 tok/s, 2026-10-10, with staged prefetch on). The simulator (`tools/sim`, packs `reap224_q23` / `reap224_q22`) predicts no change
 (−2%, within its error): top-8 routing reads the same bytes per token. Prefill, which streams every expert over PCIe
 per chunk, moves 21% fewer bytes.
 

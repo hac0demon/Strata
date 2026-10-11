@@ -1780,6 +1780,8 @@ add_executable(strata-glm-q2-kernel-bench tools/glm_q2_kernel_bench.cpp)
 target_link_libraries(strata-glm-q2-kernel-bench PRIVATE strata_kernels_cpu strata_artifact strata_host)
 add_executable(strata-glm-assemble tools/glm_assemble.cpp)
 target_link_libraries(strata-glm-assemble PRIVATE strata_artifact strata_host)
+add_executable(strata-glm-prune-experts tools/glm_prune_experts.cpp)
+target_link_libraries(strata-glm-prune-experts PRIVATE strata_artifact strata_host)
 add_executable(strata-glm-q2-pack tools/glm_q2_pack.cpp)
 target_link_libraries(strata-glm-q2-pack PRIVATE strata_kernels_cpu strata_artifact strata_host)
 # MiMo-V2 (mimo2) counterpart: same sidecar format, MXFP4 source, routed layers 1..47; no GLM code path involved.

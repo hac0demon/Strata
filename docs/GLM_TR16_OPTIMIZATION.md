@@ -1214,8 +1214,19 @@ per MTP token. Scripts: `build-spec/adaptive_bound.py`, `build-spec/suffix_repla
   Suffix drafting pays only when the answer repeats the context (code edits, refactors, agent tool loops).
 - **Planner.** `glm_sim.py plan --target-decode 40` finds nothing lossless at 40; every 40+ candidate combines a
   block drafter (DFlash) with lossy routing levers.
-- **Implemented, not yet timed:** `STRATA_GLM_MTP_LOOKUP_POLICY=cost` (patch `build-spec/cost-policy.patch` on the
-  streaming source; built in `build-spec/cost-cuda`): lookup drafts compete with MTP by expected tokens per ms
-  (per-bucket acceptance learned online, verify cost per width averaged online) and are accepted only on exact
-  matches. Screen queued: `build-spec/run_lookup_screen.sh` (control / replace / cost on two edit-style prompts
-  and the 8K held-out code prompt).
+- **Cost-aware lookup policy** (`STRATA_GLM_MTP_LOOKUP_POLICY=cost`, patch `build-spec/cost-policy.patch` on the
+  streaming source, binary `build-spec/cost-cuda`): a lookup (suffix) draft replaces the MTP draft only when its
+  expected tokens per ms is higher. Per-token acceptance is learned per match-length bucket from optimistic starts
+  (0.55 / 0.75 / 0.88 / 0.95 for 4-7 / 8-15 / 16-23 / 24+ tokens); matches of 24+ tokens are always taken;
+  verify cost per window width starts from TR16 measurements (4 wide 101-103 ms, 8 wide 156-179 ms) and is
+  refined online; lookup tokens are accepted only on exact target matches (lossless). Indicative screen
+  (2026-10-12, another agent's builds on the machine; soft4 Q22 base, MTP depth 3, 512 tokens x 3, medians):
+
+  | Prompt | MTP only | Any match replaces MTP (old rule) | Cost policy |
+  |---|---:|---:|---:|
+  | edit-cpp (rewrite a C++ file with comments) | 31.9 | 39.3 | **38.6 (+21%)** |
+  | edit-py (reformat a Python file) | 33.8 | 32.1 | **33.6 (−0.6%)** |
+  | 8K held-out code review | 28.5 | 27.6 | **28.2 (−1%)** |
+
+  Lookup acceptance: edit-cpp 92%, edit-py about 53-62%, review about 41%. Earlier versions show why each rule
+  matters: pessimistic priors (0.3-0.7) took no lookup at all (edit-cpp 31.2); without the 24+ rule, +10-15%.

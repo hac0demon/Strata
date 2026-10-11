@@ -3740,7 +3740,7 @@ class Decoder {
         trace_seen();
         host_selected.assign(host_ids, host_ids + m.top_k * nt);
         auto &selected = host_selected;
-        if(expert_observer)expert_observer->input(l,position,nt,m.hidden,m.top_k,selected.data(),activation);
+        if(expert_observer)expert_observer->input(l,position,nt,m.hidden,m.top_k,selected.data(),activation,routing);
         if(block_screen)block_screen->input(l,position,nt,m.hidden,m.top_k,selected.data(),routing,activation);
         ram_touch(l, selected.data(), nullptr, nt * m.top_k);
         trace_routes(l, position, nt, m.top_k, selected.data());
@@ -4082,7 +4082,7 @@ class Decoder {
         for (int j = 0; j < nt * K; ++j)
             if (selected[j] < 0 || selected[j] >= m.experts) throw std::runtime_error("GLM: invalid published expert");
         if (primary) {
-            if (expert_observer) expert_observer->input(l, position, nt, H, K, selected, activation);
+            if (expert_observer) expert_observer->input(l, position, nt, H, K, selected, activation, routing);
             if (block_screen) block_screen->input(l, position, nt, H, K, selected, routing, activation);
             if (!cache_probe_routes.empty())
                 for (int j = 0; j < nt * K; ++j) ++cache_probe_routes.at(l).at(selected[j]);
