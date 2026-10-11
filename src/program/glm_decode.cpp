@@ -2534,6 +2534,7 @@ class Decoder {
         std::vector<LayerState> layers;
         int position = 0, draft_position = 0;
         bool draft_primed = false;
+        bool draft_ready = false;  // mtp_ready of this sequence: reset() of another slot must not clear it
         std::vector<float> hidden, draft_hidden;
         std::unique_ptr<Device> previous_hidden;
     };
@@ -6756,6 +6757,8 @@ class Decoder {
             }
         }
     }
+    // The current sequence's draft (MTP) state is primed (prepare_mtp ran since its last reset).
+    bool draft_ready() const { return mtp_ready; }
     void select_sequence(int slot) {
         if (slot < 0 || slot >= (int)sequences.size() || !row_sequences.empty())
             throw std::invalid_argument("GLM: invalid sequence slot");
@@ -6764,9 +6767,10 @@ class Decoder {
         clear_verify_history();
         auto &old = sequences[current_sequence];
         old.position = position; old.draft_position = mtp_position; old.draft_primed = mtp_primed;
+        old.draft_ready = mtp_ready;
         old.hidden.swap(target_hidden); old.draft_hidden.swap(mtp_hidden); old.previous_hidden.swap(mtp_prev_hidden);
         auto &next = sequences[slot];
-        mtp_position = next.draft_position; mtp_primed = next.draft_primed;
+        mtp_position = next.draft_position; mtp_primed = next.draft_primed; mtp_ready = next.draft_ready;
         next.hidden.swap(target_hidden); next.draft_hidden.swap(mtp_hidden); next.previous_hidden.swap(mtp_prev_hidden);
         states.swap(sequences[current_sequence].layers);
         states.swap(sequences[slot].layers);
@@ -9204,6 +9208,8 @@ static int serve(int argc, char **argv) {
         }
         if (request.line == "QUIT")
             break;
+        int sent = 0;                 // T lines written for this request
+        size_t request_prompt = 0;    // its prompt length, for the DONE line of a cancelled request
         try {
             if (request.line.starts_with("TUNE ") && std::getenv("STRATA_GLM_ALLOW_TUNE")) {
                 std::istringstream settings(request.line.substr(5));
@@ -9232,6 +9238,7 @@ static int serve(int argc, char **argv) {
                                        enabled(2), enabled(3), enabled(4), enabled(5), enabled(6),
                                        options.size() > 7 ? std::stoi(options[7]) : 1);
                 std::cout << "TUNED\n" << std::flush;
+                { std::lock_guard lock(mutex); active.reset(); }
                 continue;
             }
             std::istringstream command(request.line);
@@ -9243,6 +9250,7 @@ static int serve(int argc, char **argv) {
             const auto tokens = token_ids(ids);
             if (tokens.empty() || count < 1 || tokens.size() + (size_t)count > (size_t)ctx)
                 throw std::invalid_argument("request exceeds context or has invalid token counts");
+            request_prompt = tokens.size();
             auto start = Clock::now();
             decoder.reset();
             std::cerr << "RESPONSE_PREPARE kind=request_reset ms=" << millis(start, Clock::now()) << '\n';
@@ -9282,6 +9290,7 @@ static int serve(int argc, char **argv) {
             if (use_mtp && !*request.cancel) {
                 auto result = generate_mtp(decoder, logits, count, stops, draft_depth, [&](int token) {
                     if (*request.cancel) throw std::runtime_error("cancelled");
+                    ++sent;
                     std::cout << "T " << token << '\n' << std::flush;
                 }, &tokens);
                 generated = result.generated;
@@ -9291,6 +9300,7 @@ static int serve(int argc, char **argv) {
                     generate_lookup(decoder, logits, tokens, count, stops, lookup_depth, [&](int token) {
                         if (*request.cancel)
                             throw std::runtime_error("cancelled");
+                        ++sent;
                         std::cout << "T " << token << '\n' << std::flush;
                     });
                 generated = result.generated;
@@ -9299,10 +9309,11 @@ static int serve(int argc, char **argv) {
             } else
                 for (; generated < count; ++generated) {
                     if (*request.cancel) {
-                        finish = "stop";
+                        finish = "cancel";
                         break;
                     }
                     const int next = std::max_element(logits.begin(), logits.end()) - logits.begin();
+                    ++sent;
                     std::cout << "T " << next << '\n' << std::flush;
                     if (std::find(stops.begin(), stops.end(), next) != stops.end()) {
                         ++generated;
@@ -9325,19 +9336,22 @@ static int serve(int argc, char **argv) {
                 // for the stdin reader here would hide the error indefinitely.
                 std::_Exit(1);
             }
-            if (request.cancel->load())
-                std::cout << "DONE 0 0 0 0 stop 0 0 0\n" << std::flush;
+            // Only the cancellation itself is reported as a cancel: a real failure that coincides with a STOP
+            // is still an ERR. The tokens already sent are counted.
+            if (request.cancel->load() && std::string(e.what()) == "cancelled")
+                std::cout << "DONE " << sent << ' ' << request_prompt << " 0 0 cancel 0 0 0\n" << std::flush;
             else
                 std::cout << "ERR " << e.what() << '\n' << std::flush;
         }
         decoder.set_cancel({});
+        // The request is over: a STOP from now on belongs to the next one (it cancels the queued request).
+        { std::lock_guard lock(mutex); active.reset(); }
         try { decoder.flush_expert_observer(); decoder.report_gpu(); decoder.report_cache(); }
         catch (const std::exception &e) {
-            std::cout << "ERR GPU reporting failed: " << e.what() << '\n' << std::flush;
+            // DONE/ERR was already sent for this request: a second line would be read as the next request's.
+            std::cerr << "GLM: reporting after a request failed: " << e.what() << '\n' << std::flush;
             std::_Exit(1);
         }
-        std::lock_guard lock(mutex);
-        active.reset();
     }
     return 0;
 }
