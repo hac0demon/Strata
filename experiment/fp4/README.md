@@ -101,8 +101,26 @@ on real layer-1 experts that costs a weight NMSE of 0.10-0.12 for Q2_K gate/up a
 - CPU (`cpu/kq_cpu.h`): AVX2 ports of `ggml_vec_dot_q2_K_q8_K` / `q3_K`; full MoE layers for the q23 mix
   (Q2_K gate/up + Q3_K down, 72.9 MB per layer) and ggml-org's Q2_K GGUF mix (Q2_K gate/up + MXFP4 down,
   79.7 MB). Selftest: exact against fp64 on the q8_K-quantized input (<= 5e-7); the per-256 q8_K activation
-  scale itself costs 2-4% with the outlier activations used here. **CPU timing not yet measured** (the
-  machine was busy with conversions); `bench_cpu` runs it by default (`--no-kquant` / `--kquant-only`).
+  scale itself costs 2-4% with the outlier activations used here. `bench_cpu` runs them by default
+  (`--no-kquant` / `--kquant-only`). Measured on the 1950X (2026-10-12, machine idle, 116 GB free; real
+  layer-1 experts, `results/20261012-kquant-cpu/`), median us per call, same session as the MXFP4 layer:
+
+  | kernel | 8 threads | 16 threads | GB/s at 16 |
+  |---|---:|---:|---:|
+  | Q2_K gate+up, 8 experts (44.0 MB) | 1437 | 1173 | 37.6 |
+  | Q3_K down, 8 experts (28.8 MB) | 752 | 743 | 38.8 |
+  | MoE layer, q23 mix (72.9 MB) | 2890 | 1969 | 37.0 |
+  | MoE layer, Q2_K + MXFP4 down (79.7 MB) | 2468 | 2094 | 38.1 |
+  | MoE layer, MXFP4 c2 (106.9 MB), for comparison | 2388 | 1540 | 69.5 |
+
+  The K-quant kernels are compute bound on Zen1: 37-41 GB/s at 8-16 threads on dummy and real weights, while
+  the read reference reaches 84 GB/s and the MXFP4 layer 69.5 GB/s in the same session. So on this CPU the
+  q23 layer, 32% fewer bytes, is 28% slower than MXFP4 (1.97 vs 1.54 ms; expert part at 47 layers about
+  11 vs 14 tok/s). The q23 pack is what fits in 128 GB, but making it pay off on the CPU needs a faster Q2_K
+  dot (the ggml AVX2 port unpacks 4-bit scales and mins per 16 and does two madd chains per block). 32-thread
+  (SMT) timings varied 3x between runs (436-2079 us for Q3_K down) and are not used. A first run with 120 GB
+  of page cache and 1 GB free per node measured 42-54 GB/s read bandwidth instead of 80-85 GB/s; it is kept
+  in `results/20261012-kquant-cpu/busy-pagecache/` and not used.
 - GPU (`gpu/kq_gpu.cuh`): dp4a GEMVs on the native 84/110-byte blocks with int8 activations per 32 (plus
   per-16 sums for the Q2_K mins), R rows per lane group so loads overlap; fused 2-launch MoE layers.
   Exact against fp64 on their quantized input (6/6 in `--mode selftest`). Measured (`--mode kquant`,
