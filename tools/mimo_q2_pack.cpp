@@ -8,7 +8,8 @@
 //
 // MiMo differs from GLM in the layer range (layer 0 is dense, routed layers 1..47; the 3 MTP blocks 48..50 are
 // dense) and the source type: the checkpoint ships its experts as MXFP4, which this tool dequantizes exactly
-// (ggml MXFP4 -> f32) before requantizing. No calibration path exists for MiMo yet, so packs are uncalibrated.
+// (ggml MXFP4 -> f32) before requantizing. Calibration: --imatrix=FILE takes the per-expert input importance from
+// llama.cpp's llama-imatrix run on the same model (it supports mimo2); --uncalibrated quantizes unweighted.
 #include "strata/artifact/gguf_reader.hpp"
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -40,11 +41,11 @@ uint64_t hash_bytes(uint64_t hash,const uint8_t* p,size_t n){for(size_t i=0;i<n;
 
 struct Entry {std::string name;const TensorInfo* source;const GgufFile* file;uint32_t type;uint64_t offset,bytes,hash=0;double error=0,norm=0;};
 
-std::string header(const std::vector<Entry>& entries,uint64_t source) {
+std::string header(const std::vector<Entry>& entries,uint64_t source,bool calibrated) {
     std::ostringstream out(std::ios::binary);write<uint32_t>(out,0x46554747);write<uint32_t>(out,3);write<uint64_t>(out,entries.size());write<uint64_t>(out,entries.size()+4);
     string(out,"strata.expert_pack.version");write<uint32_t>(out,4);write<uint32_t>(out,1);
     string(out,"strata.expert_pack.source");write<uint32_t>(out,10);write<uint64_t>(out,source);
-    string(out,"strata.expert_pack.calibrated");write<uint32_t>(out,7);write<uint8_t>(out,0);
+    string(out,"strata.expert_pack.calibrated");write<uint32_t>(out,7);write<uint8_t>(out,calibrated);
     string(out,"strata.expert_pack.architecture");write<uint32_t>(out,8);string(out,"mimo2");
     for(const auto& e:entries){string(out,"strata.expert_pack.hash."+e.name);write<uint32_t>(out,10);write<uint64_t>(out,e.hash);}
     for(const auto& e:entries){string(out,e.name);write<uint32_t>(out,3);for(auto d:e.source->shape)write<uint64_t>(out,d);write<uint32_t>(out,e.type);write<uint64_t>(out,e.offset);}
@@ -93,6 +94,27 @@ const TensorInfo& at(const GgufModel& model,const std::string& name,const GgufFi
     *file=&g;return *t;
 }
 
+// llama.cpp `llama-imatrix` output (GGUF): `<weight>.in_sum2` F32 [columns, experts] (sum of squared inputs per
+// expert) and `<weight>.counts` F32 [experts]. The per-expert mean squared input is the importance that
+// ggml_quantize_chunk weights the reconstruction error with (the same quantity Strata's GLM calibration records).
+// An expert the calibration text never reached gets the layer's mean over all routed tokens.
+std::vector<float> imatrix_importance(const GgufFile& im,const std::string& weight,int columns,int experts) {
+    const auto* sum=im.find(weight+".in_sum2");const auto* cnt=im.find(weight+".counts");
+    if(!sum||!cnt)throw std::runtime_error("imatrix has no entry for "+weight);
+    if(sum->type!=0||cnt->type!=0||sum->shape!=std::vector<uint64_t>{uint64_t(columns),uint64_t(experts)}||cnt->shape!=std::vector<uint64_t>{uint64_t(experts)})
+        throw std::runtime_error("imatrix geometry mismatch for "+weight);
+    const float* s=reinterpret_cast<const float*>(im.tensor_data(*sum));const float* c=reinterpret_cast<const float*>(im.tensor_data(*cnt));
+    std::vector<double> pooled(columns,0.);double total=0;
+    for(int e=0;e<experts;++e){total+=c[e];for(int k=0;k<columns;++k)pooled[k]+=s[size_t(e)*columns+k];}
+    std::vector<float> out(size_t(columns)*experts);
+    for(int e=0;e<experts;++e)for(int k=0;k<columns;++k) {
+        const double v=c[e]>0?s[size_t(e)*columns+k]/c[e]:(total>0?pooled[k]/total:1.);
+        if(!std::isfinite(v)||v<0)throw std::runtime_error("nonfinite or negative imatrix value for "+weight);
+        out[size_t(e)*columns+k]=float(std::max(v,1e-12));
+    }
+    return out;
+}
+
 int verify(const std::string& model_path,const std::string& pack_path) {
     const auto model=GgufModel::open(model_path);uint64_t experts=0;check_model(model,experts);
     GgufFile pack(pack_path);
@@ -123,11 +145,17 @@ int main(int argc,char** argv){try {
         if(argc!=4)throw std::runtime_error("usage: strata-mimo-q2-pack --verify MODEL PACK");
         return verify(argv[2],argv[3]);
     }
-    if(argc<3)throw std::runtime_error("usage: strata-mimo-q2-pack MODEL OUTPUT --uncalibrated [--first-layer=1] [--last-layer=47] [--threads=16] [--down=q3|q2]");
-    bool uncalibrated=false;int first=1,last=47,threads=16;uint32_t down_type=kQ3K;
-    for(int i=3;i<argc;++i){std::string arg=argv[i];if(arg=="--down=q2")down_type=kQ2K;else if(arg=="--down=q3")down_type=kQ3K;else if(arg=="--uncalibrated")uncalibrated=true;else if(arg.starts_with("--first-layer="))first=std::stoi(arg.substr(14));else if(arg.starts_with("--last-layer="))last=std::stoi(arg.substr(13));else if(arg.starts_with("--threads="))threads=std::stoi(arg.substr(10));else throw std::runtime_error("unknown argument "+arg);}
-    // No MiMo calibration exists yet: the flag is required so a future calibrated pack is never confused with this one.
-    if(!uncalibrated||first<1||first>last||threads<1||threads>32)throw std::runtime_error("invalid settings: --uncalibrated is required, layers >= 1, threads 1..32");
+    if(argc<3)throw std::runtime_error("usage: strata-mimo-q2-pack MODEL OUTPUT (--imatrix=FILE | --uncalibrated) [--first-layer=1] [--last-layer=47] [--threads=16] [--down=q3|q2]");
+    bool uncalibrated=false;int first=1,last=47,threads=16;uint32_t down_type=kQ3K;std::string imatrix_path;
+    for(int i=3;i<argc;++i){std::string arg=argv[i];if(arg=="--down=q2")down_type=kQ2K;else if(arg=="--down=q3")down_type=kQ3K;else if(arg=="--uncalibrated")uncalibrated=true;else if(arg.starts_with("--imatrix="))imatrix_path=arg.substr(10);else if(arg.starts_with("--first-layer="))first=std::stoi(arg.substr(14));else if(arg.starts_with("--last-layer="))last=std::stoi(arg.substr(13));else if(arg.starts_with("--threads="))threads=std::stoi(arg.substr(10));else throw std::runtime_error("unknown argument "+arg);}
+    // Calibration must be explicit: an imatrix from llama-imatrix on the same model, or --uncalibrated.
+    if(uncalibrated==!imatrix_path.empty()||first<1||first>last||threads<1||threads>32)throw std::runtime_error("invalid settings: choose --imatrix=FILE or --uncalibrated; layers >= 1, threads 1..32");
+    std::unique_ptr<GgufFile> imatrix;
+    if(!imatrix_path.empty()) {
+        imatrix=std::make_unique<GgufFile>(imatrix_path);
+        const auto* type=imatrix->get("general.type");
+        if(!type||type->s!="imatrix")throw std::runtime_error("not a llama-imatrix GGUF: "+imatrix_path);
+    }
     const auto model=GgufModel::open(argv[1]);uint64_t experts=0;check_model(model,experts);
     const uint64_t blocks=meta_u(model.meta(),"mimo2.block_count");
     const std::filesystem::path output(argv[2]),partial=output.string()+".partial";
@@ -146,7 +174,7 @@ int main(int argc,char** argv){try {
     }
     if(entries.empty())throw std::runtime_error("no routed expert projections in the layer range");
     if(std::filesystem::space(output.parent_path().empty()?".":output.parent_path()).available<offset+(uint64_t(2)<<30))throw std::runtime_error("insufficient disk capacity for pack plus 2 GiB reserve");
-    const auto fingerprint=source_fingerprint(model);auto h=header(entries,fingerprint);
+    const auto fingerprint=source_fingerprint(model);auto h=header(entries,fingerprint,!imatrix_path.empty());
     std::cerr<<"PACK plan projections="<<entries.size()<<" bytes="<<offset+h.size()<<" source_fingerprint="<<fingerprint<<'\n';
     std::ofstream out(partial,std::ios::binary|std::ios::trunc);out.exceptions(std::ios::failbit|std::ios::badbit);out.write(h.data(),h.size());
     ggml_cpu_init();
@@ -162,6 +190,7 @@ int main(int argc,char** argv){try {
         const auto& t=*e.source;const int cols=t.shape[0],rows=t.shape[1],nexp=t.shape[2];
         const size_t slice=e.bytes/nexp,source_slice=ggml_row_size(ggml_type(t.type),cols)*rows;
         e.hash=kFnvBasis;
+        const std::vector<float> importance=imatrix?imatrix_importance(*imatrix,e.name,cols,nexp):std::vector<float>{};
         for(int base=0;base<nexp;base+=threads) {
             const int count=std::min(threads,nexp-base);std::vector<std::vector<uint8_t>> packed(count,std::vector<uint8_t>(slice));
             std::vector<std::jthread> workers;std::vector<std::exception_ptr> errors(count);std::vector<double> err(count),norm(count);
@@ -169,10 +198,11 @@ int main(int argc,char** argv){try {
                 const int expert=base+j;std::vector<float> weights(size_t(cols)*rows),decoded(cols);
                 ggml_get_type_traits(ggml_type(t.type))->to_float(e.file->tensor_data(t)+size_t(expert)*source_slice,weights.data(),weights.size());
                 for(float value:weights)if(!std::isfinite(value))throw std::runtime_error("nonfinite source expert weight");
-                const auto written=ggml_quantize_chunk(ggml_type(e.type),weights.data(),packed[j].data(),0,rows,cols,nullptr);if(written!=slice)throw std::runtime_error("quantizer byte count mismatch");
+                const float* im=importance.empty()?nullptr:importance.data()+size_t(expert)*cols;
+                const auto written=ggml_quantize_chunk(ggml_type(e.type),weights.data(),packed[j].data(),0,rows,cols,im);if(written!=slice)throw std::runtime_error("quantizer byte count mismatch");
                 for(int r=0;r<rows;++r) {
                     ggml_get_type_traits(ggml_type(e.type))->to_float(packed[j].data()+size_t(r)*slice/rows,decoded.data(),cols);
-                    for(int k=0;k<cols;++k){const double w=weights[size_t(r)*cols+k],delta=double(decoded[k])-w;err[j]+=delta*delta;norm[j]+=w*w;}
+                    for(int k=0;k<cols;++k){const double w=weights[size_t(r)*cols+k],scale=im?im[k]:1.,delta=double(decoded[k])-w;err[j]+=scale*delta*delta;norm[j]+=scale*w*w;}
                 }
             }catch(...){errors[j]=std::current_exception();}});
             for(auto& worker:workers)worker.join();
@@ -185,9 +215,9 @@ int main(int argc,char** argv){try {
                  <<" done="<<ei+1<<"/"<<entries.size()<<" elapsed_s="<<std::setprecision(5)<<s<<'\n';
     }
     if(source_fingerprint(model)!=fingerprint)throw std::runtime_error("source identity changed during conversion");
-    h=header(entries,fingerprint);out.seekp(0);out.write(h.data(),h.size());out.close();
+    h=header(entries,fingerprint,!imatrix_path.empty());out.seekp(0);out.write(h.data(),h.size());out.close();
     std::filesystem::rename(partial,output);
-    std::ofstream report(output.string()+".quality.json");report.exceptions(std::ios::failbit|std::ios::badbit);report<<"{\"architecture\":\"mimo2\",\"source_fingerprint\":\""<<fingerprint<<"\",\"calibrated\":false,\"projections\":[";
+    std::ofstream report(output.string()+".quality.json");report.exceptions(std::ios::failbit|std::ios::badbit);report<<"{\"architecture\":\"mimo2\",\"source_fingerprint\":\""<<fingerprint<<"\",\"calibrated\":"<<(imatrix?"true":"false")<<",\"projections\":[";
     for(size_t i=0;i<entries.size();++i){const auto& e=entries[i];if(i)report<<',';report<<"{\"name\":\""<<e.name<<"\",\"bytes\":"<<e.bytes<<",\"normalized_mse\":"<<std::setprecision(12)<<e.error/std::max(e.norm,1e-30)<<'}';}report<<"]}\n";
     std::cerr<<"PACK complete path="<<output<<" bytes="<<offset+h.size()<<'\n';
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}}

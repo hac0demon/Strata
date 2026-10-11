@@ -147,8 +147,12 @@ below has been run through the engine.
    sampled experts of layers 1, 23 and 47 match the safetensors bit for bit. About 15 minutes.
 2. **Pack.** `strata-mimo-q2-pack` (`tools/mimo_q2_pack.cpp`) is a separate tool, not a change to the GLM
    one: same sidecar format, keys and source fingerprint as `strata-glm-q2-pack`, plus
-   `strata.expert_pack.architecture = "mimo2"`; routed layers 1..47; MXFP4 or K-quant sources;
-   `--uncalibrated` is required until a MiMo calibration exists.
+   `strata.expert_pack.architecture = "mimo2"`; routed layers 1..47; MXFP4 or K-quant sources.
+   Calibration is explicit: `--imatrix=FILE` weights the quantization with the per-expert mean squared inputs
+   of a llama.cpp `llama-imatrix` run on the same GGUF (`<weight>.in_sum2` / `<weight>.counts`; an expert the
+   text never reached gets the layer's pooled mean), or `--uncalibrated`. The imatrix path was checked on one
+   layer with a synthetic imatrix (pack verifies, `calibrated` recorded); a real imatrix run over this 168 GB
+   base has not been done.
 
    ```
    build-glm-release/strata-mimo-q2-pack MiMo-V2.6-Flash-RL-MXFP4.gguf experts-q23.gguf --uncalibrated --threads=16
