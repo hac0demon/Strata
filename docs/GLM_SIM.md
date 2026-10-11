@@ -9,6 +9,11 @@ and on the other recorded runs within 10-25 % (see "Validation").
 
 B550 has a separate [measurement report and reproducible calibration](GLM_B550_SIM.md). Its 512-token lever checkpoint averages 2.01% error on same-fixture timing checks, with one continuation-margin forecast outside tolerance. Its fit is provisional and must be selected with `--params tools/sim/data/params_b550.json`; no 20 tok/s configuration is qualified.
 
+The [2026-10-09 TR16 experiment](GLM_TR16_OPTIMIZATION.md) adds guarded CUDA runs,
+frozen 2K/8K prompts and explicit training/holdout imports. It uses the measured
+PCIe 3.0 x8 link and current desktop memory footprint. Its experimental records
+and fits do not replace the historical defaults below.
+
 Run it with the system `python3` (numpy is needed only for routing-trace replay):
 
 ```sh
@@ -278,3 +283,39 @@ With q22 in a frozen RAM set, DFlash8 gives 12.0 vs MTP2's 13.4 tok/s (14.4 vs 1
 - Context-length effects on attention are small in the model (MLA uses a top-2048 indexer); very long contexts
   are not validated.
 - Nothing here measures the machine: all inputs come from `docs/` and `build-q2-*` traces.
+
+## Multinode split search (2026-10-10)
+
+`python3 tools/sim/glm_sim.py multinode --node tr16 --node b550 --link ib --pack q23 --speculation mtp --mtp 1 --affinity 0.08 --decode-cache-mib 5632`
+ranks the share of the routed expert work given to each worker node (up to three
+workers; the first `--node` is the decoder). Workers are described by their own
+CPU and memory (`hw.WorkerNode`, built from a preset or a hardware JSON with
+`hw.worker_from_hardware`) and a link (`hw.LINKS`: `ib` degraded ConnectX-3 as
+measured, `ib-qdr` healthy estimate, `gbe` measured, `10gbe` estimate, or
+`rtt_us,gbps,exposed_us`). In `decode.remote_layer_ms` each worker runs its share
+through `kernels.cpu_roofline`, plus `request_overhead_ms` (0.15 ms, from the
+B550 worker's 0.78 ms per 16 MB request), the link round trip, the wire time of
+the 4.8 KB request and 8/16 KB reply per token, and the measured exposed wait;
+the layer waits for the slowest node. `--split expert` scores whole-expert
+partitions with an imbalance factor `1 + expert_split_imbalance / sqrt(top_k × share)`
+(`Params.expert_split_imbalance`, 0.35, unvalidated). RAM fit (rows + 2 GiB per
+worker, local rows + 7 GiB on the decoder) prunes assignments; `shipping_s` is
+the start-up transfer at the slower of link and decoder disk. The legacy
+single-worker presets (`tr16+b550-ib`, `tr16+b550-1gbe`) keep their calibrated
+pure-bandwidth model (`tools/test_sim_multinode.py` pins 14.14 / 16.05 / 12.18
+tok/s for shares 0 / 0.25 / 0.5 with reap50_q23). Validation status: one
+InfiniBand worker ±30%; more workers and the expert split are unvalidated.
+
+## GLM-5.3 (743B) mode
+
+`glm_sim.py --model glm53 <command> …` switches to the GLM-5.3 geometry (78 layers,
+75 MoE, hidden 6144, 256 experts, all-MLA) with estimated fixed-weight tables and
+the `glm53*` packs (`model.use_model`). Fixed weights are estimated from the
+config, kernel parameters are the Flash TR16 calibration; see
+`docs/GLM53_FULL_TR16_B550.md` for the study and its ±40% caveat.
+
+## MiMo-V2.6 modes
+
+`--model mimo_flash` and `--model mimo_pro` add MiMo-V2.6 Flash (309B, 47 MoE layers,
+256 experts, hidden 4096) and Pro (1T, 69 MoE layers, 384 experts, hidden 6144) with
+`mimof*` / `mimop*` packs; see `docs/MIMO_V26_TR16_B550.md`. Same caveats as GLM-5.3.

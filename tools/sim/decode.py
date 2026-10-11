@@ -8,6 +8,7 @@ runs under the other group's CPU pass: per layer, max(cpuA, gpuB) + max(cpuB, gp
 """
 import dataclasses
 import math
+import types
 
 import kernels
 import model
@@ -24,7 +25,7 @@ class StepBreakdown:
     ms: float
     head_ms: float
     cpu_ms: float
-    gpu_ms: float            # all GPU work in MoE layers (serial chain + shared + resident experts)
+    gpu_ms: float            # all main-layer GPU work, including the three dense layers
     gpu_exposed_ms: float    # GPU time the CPU waited for
     cpu_exposed_ms: float    # CPU time the GPU waited for (= cpu_ms unless the GPU is the long pole)
     handoff_ms: float
@@ -278,11 +279,9 @@ def step(hw, cfg, params, width, pack=None, plan=None, hit=None, rows=1, consecu
                 # become a fictitious second memory channel. This is a lower bound.
                 shared_ms = (local_bytes + host_streamed) / (hw.memory.dram_gbps * 1e6)
                 t_cpu = max(t_cpu, shared_ms)
-            if cfg.remote_share > 0 and hw.remote.expert_gbps > 0:
-                remote_bytes = nonres * cfg.remote_share
-                t_remote = remote_bytes / (hw.remote.expert_gbps * 1e9) * 1e3 + hw.link.rtt_us * 1e-3
-                remote += max(0.0, t_remote - t_cpu) + hw.link.exposed_us * 1e-3
-                t_cpu = max(t_cpu, t_remote) + hw.link.exposed_us * 1e-3
+            if cfg.remote_share > 0 and (hw.workers or hw.remote.expert_gbps > 0):
+                t_cpu, exposed_remote = remote_layer_ms(hw, cfg, params, nonres, macs, w, eff, t_cpu)
+                remote += exposed_remote
             cpu_bytes += local_bytes
             cpu_ms += t_cpu
             if cfg.placement == "ram_tier" and ram_hit < 1.0:
@@ -358,6 +357,50 @@ def step(hw, cfg, params, width, pack=None, plan=None, hit=None, rows=1, consecu
                          groups=len(widths))
 
 
+def remote_shares(hw, cfg):
+    """Per-worker share of every layer's non-resident expert work (multinode model); [] without hw.workers."""
+    if not hw.workers:
+        return []
+    if cfg.remote_shares:
+        shares = [float(x) for x in cfg.remote_shares.split(",")]
+        if len(shares) != len(hw.workers):
+            raise ValueError("remote_shares must list one share per worker")
+        return shares
+    return [cfg.remote_share / len(hw.workers)] * len(hw.workers)
+
+
+def remote_layer_ms(hw, cfg, params, nonres, macs, width, eff, t_cpu):
+    """One MoE layer with remote expert workers: (layer time, exposed remote wait).
+
+    Legacy single worker (no hw.workers): the calibrated pure-bandwidth model. Multinode: every worker runs its share
+    through its own CPU roofline, plus the fixed request cost, the link round trip and the wire time of the request
+    (4.8 KB) and the reply (8 KB f16 or 16 KB f32 per token); the layer waits for the slowest node, and the exposed
+    wait after overlap is added. An expert-index split streams whole experts per node, so routing makes the per-node
+    load uneven; the expected excess over the mean is modelled as expert_split_imbalance / sqrt(top_k * share).
+    """
+    if not hw.workers:
+        remote_bytes = nonres * cfg.remote_share
+        t_remote = remote_bytes / (hw.remote.expert_gbps * 1e9) * 1e3 + hw.link.rtt_us * 1e-3
+        exposed = max(0.0, t_remote - t_cpu) + hw.link.exposed_us * 1e-3
+        return max(t_cpu, t_remote) + hw.link.exposed_us * 1e-3, exposed
+    slowest, exposed_us = t_cpu, 0.0
+    reply = 8196 if cfg.remote_reply == "f16" else 16384
+    for node, share in zip(hw.workers, remote_shares(hw, cfg)):
+        if share <= 0:
+            continue
+        bytes_i, macs_i = nonres * share, macs * share
+        if cfg.split_mode == "expert":
+            skew = 1 + params.expert_split_imbalance / math.sqrt(max(1e-9, GEOMETRY.top_k * share))
+            bytes_i, macs_i = bytes_i * skew, macs_i * skew
+        node_hw = types.SimpleNamespace(cpu=node.cpu, memory=node.memory)
+        t_i, _ = kernels.cpu_roofline(node_hw, params, bytes_i, macs_i, width, node.cpu.workers(node.threads), eff)
+        wire_ms = (4800 + width * reply) / (max(node.link.gbps, 1e-6) * 1e9) * 1e3
+        t_i += node.request_overhead_ms + node.link.rtt_us * 1e-3 + wire_ms
+        slowest = max(slowest, t_i)
+        exposed_us = max(exposed_us, node.link.exposed_us)
+    return slowest + exposed_us * 1e-3, max(0.0, slowest - t_cpu) + exposed_us * 1e-3
+
+
 def draft_step_ms(hw, cfg, params, pack, head=True, plan=None, rows=1):
     """One MTP draft step: embedding, draft MLA, 8 draft experts per row, optional LM head."""
     g = GEOMETRY
@@ -404,8 +447,12 @@ def simulate(hw, cfg, params=None, trace=None, prior=None):
     local_gib = pack.routed_total_bytes() / 2 ** 30 * (1 - cfg.remote_share) * (1 - cfg.cold_share * (1 - cfg.cold_scale)) * (1 - min(1.0, cfg.cold_layers / GEOMETRY.moe_layers) * (1 - cfg.cold_scale))
     if cfg.placement == "cpu" and local_gib + 7 > hw.memory.gib + hw.memory.page_cache_gib:
         notes.append(f"local expert rows ({local_gib:.1f} GiB) do not fit host RAM; use placement=ram_tier")
-    if cfg.remote_share > 0 and hw.remote.ram_gib and pack.routed_total_bytes() / 2 ** 30 * cfg.remote_share + 2 > hw.remote.ram_gib:
+    if cfg.remote_share > 0 and not hw.workers and hw.remote.ram_gib and pack.routed_total_bytes() / 2 ** 30 * cfg.remote_share + 2 > hw.remote.ram_gib:
         notes.append(f"remote rows ({pack.routed_total_bytes() / 2 ** 30 * cfg.remote_share:.1f} GiB) exceed the worker's RAM")
+    for node, share in zip(hw.workers, remote_shares(hw, cfg)):
+        gib = pack.routed_total_bytes() / 2 ** 30 * share
+        if share > 0 and gib + 2 > node.memory.gib + node.memory.page_cache_gib:
+            notes.append(f"{node.name}: rows ({gib:.1f} GiB) exceed its RAM ({node.memory.gib:.0f} GiB)")
     if cfg.placement == "ram_tier":
         h, gib = ram_hit_share(hw, cfg, pack)
         notes.append(f"RAM expert set {gib:.1f} GiB serves {h * 100:.1f} % of routed bytes ({cfg.ram_mode})")
@@ -472,7 +519,10 @@ def simulate(hw, cfg, params=None, trace=None, prior=None):
         tokens = rows + (tokens - rows) * params.ecospec_acceptance
     tok_s = tokens / round_ms * 1e3
     cpu_gbps = s.cpu_bytes / max(1e-9, s.cpu_ms) / 1e6 if s.cpu_ms else 0.0
-    gpu_round = s.gpu_ms + s.head_ms + s.tail_ms + draft + resync
+    # gpu_ms already includes the dense layers also reported in head_ms.
+    # Adding head_ms double-counted them and could put the reported ceiling
+    # below the prediction. Only the fixed head cost is additional work.
+    gpu_round = s.gpu_ms + params.head_fixed_ms + s.tail_ms + draft + resync
     cpu_ceiling = tokens / max(1e-9, s.cpu_ms + s.disk_ms) * 1e3 if s.cpu_ms else float("inf")
     gpu_ceiling = tokens / max(1e-9, gpu_round) * 1e3
     return DecodeResult(tok_s=tok_s, tokens_per_round=tokens, round_ms=round_ms, draft_ms=draft, verify_ms=verify,

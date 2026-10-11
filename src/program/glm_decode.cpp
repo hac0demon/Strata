@@ -1854,6 +1854,17 @@ class Decoder {
         if (n < 0 || n > 8) throw std::invalid_argument("GLM: STRATA_GLM_DEFER_ROUTES must be 0..8");
         return n;
     }();
+    // STRATA_GLM_DEFER_MAX_SHARE=<x>: a cold route is deferred only when its weight is below x times the layer's
+    // routed weight sum (default 1 = no cap), so layers whose smallest cold route matters stay in time.
+    const float defer_max_share = [] {
+        const char *v = std::getenv("STRATA_GLM_DEFER_MAX_SHARE");
+        const float x = v ? std::strtof(v, nullptr) : 1.f;
+        if (!(x > 0.f && x <= 1.f)) throw std::invalid_argument("GLM: STRATA_GLM_DEFER_MAX_SHARE must be in (0, 1]");
+        return x;
+    }();
+    // STRATA_GLM_DEFER_MIN_LAYER=<l>: layers below l defer nothing (their late pass is empty), since early
+    // layers are the most sensitive to delayed expert output.
+    const int defer_min_layer = [] { const char *v = std::getenv("STRATA_GLM_DEFER_MIN_LAYER"); return v ? std::atoi(v) : 0; }();
     int deferred_target(int l) const { return defer_routes ? l + mailbox_group_stride() : l; }
     bool defer_active = false;
     const bool fuse_route_publish = [] { const char *v = std::getenv("STRATA_GLM_FUSE_ROUTE"); return v && std::string(v) == "1"; }();
@@ -4829,16 +4840,19 @@ class Decoder {
                 const float *w = mailbox->weights(item.slot);
                 const auto *resident = (const unsigned long long *)cached_decode->host_lookup->p + (size_t)item.layer * 288;
                 unsigned cold = 0, late = 0;
-                for (int j = 0; j < item.tokens * K; ++j)
+                float total = 0.f;
+                for (int j = 0; j < item.tokens * K; ++j) {
+                    total += w[j];
                     if (w[j] != 0.f && !resident[ids[j]]) cold |= 1u << j;
-                for (int n = 0; n < defer_routes; ++n) {
+                }
+                for (int n = 0; n < defer_routes && item.layer >= defer_min_layer; ++n) {
                     int pick = -1;
                     for (int j = 0; j < item.tokens * K; ++j)
                         if ((cold >> j & 1u) && !(late >> j & 1u) && (pick < 0 || w[j] < w[pick])) pick = j;
-                    if (pick < 0) break;
+                    if (pick < 0 || w[pick] >= defer_max_share * total) break;
                     late |= 1u << pick;
                 }
-                if ((late & ~cold) || __builtin_popcount(late) != std::min(defer_routes, __builtin_popcount(cold)))
+                if ((late & ~cold) || __builtin_popcount(late) > std::min(defer_routes, __builtin_popcount(cold)))
                     throw std::runtime_error("GLM: deferred route selection");
                 cpu_moe_mailbox(item.layer, item.slot, item.tokens, item.position, -1, 0, ~late);
                 mailbox->complete(item.slot);

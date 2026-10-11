@@ -74,6 +74,8 @@ class RunConfig:
     ram_expert_gib: float = 0          # RAM budget for experts in ram_tier; 0 = what hw.memory leaves
     remote_share: float = 0.0          # share of each expert's rows computed by hw.remote (0.25/0.5/0.75)
     remote_reply: str = "f16"
+    remote_shares: str = ""            # multinode: comma-separated share per hw.workers entry (sum = remote_share)
+    split_mode: str = "row"            # multinode: row (implemented: FFN rows of every expert) | expert (whole experts per node)
     gpus: int = 1
     trace: str = ""                    # optional routing trace CSV for exact union / hit rates
     prior: str = ""                    # coverage.json for trace replay

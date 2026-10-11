@@ -89,7 +89,9 @@ def parse_log(log):
                 for line in log.splitlines() if line.startswith(tag + " ")]
     return dict(prefill=prefill, decode=decode,
         cpu_expert=records("CPU_EXPERT"), mtp_timing=records("MTP_TIMING"),
-        mtp_positions=records("MTP_POSITION"), step_trace=records("STEP_TRACE"),
+        mtp_positions=records("MTP_POSITION"), mtp_approx=records("MTP_APPROX"),
+        mtp_first_margin=records("MTP_FIRST_MARGIN"), mtp_reuse=records("MTP_REUSE"), mtp_sync_state=records("MTP_SYNC_STATE_ONLY"),
+        mtp_repeat_guard=records("MTP_REPEAT_GUARD"), step_trace=records("STEP_TRACE"),
         decode_cache=records("DECODE_CACHE"), speculation=records("SPECULATIVE"),
         affinity_quality=records("AFFINITY_QUALITY"), lookup_parity=records("LOOKUP_PARITY"),
         median_prefill_tok_s=statistics.median(r["tokens_per_second"] for r in prefill) if prefill else None,
