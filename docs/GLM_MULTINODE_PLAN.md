@@ -62,7 +62,7 @@ bandwidth ratio (which needs finer than 512-row steps).
 1. **Measure before building.** Run the existing two-node mode on the full
    model (Q23 pack on TR16, B550 holding 25% of the rows = 25.9 GiB, which fits
    its 60 GiB) with the qualified profile and with the fast candidate, over IB:
-   `tools/glm_remote_tp.sh b550 <worker-binary> 10.10.10.1:PORT --threads 16 --reserve-gib 2 -- <decoder command> --remote-tp-share=0.25`.
+   `tools/glm_remote_tp.sh b550 <worker-binary> <b550-ib-ip>:PORT --threads 16 --reserve-gib 2 -- <decoder command> --remote-tp-share=0.25`.
    Compare with the same-day single-node run (held-out 2K/8K, 512×3). This
    validates the simulator rows above; the expected gain is 0–11%.
 2. **If the IB link stays degraded**, do not pursue multinode for throughput; the
