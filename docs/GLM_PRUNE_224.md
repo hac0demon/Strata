@@ -45,21 +45,28 @@ RSS 116.9 GB on this 125 GB host). On those same 58 sequences, the cost of pruni
 | Q23, 224 experts | 8.804 (+1.5%) | 0.191 (+0.033) | 82.3% (−1.3 pp) |
 | Q22, 224 experts | 8.885 (+2.4%) | 0.217 (+0.058) | 81.1% (−2.4 pp) |
 
-Speed, **indicative only** (2026-10-12, measured while another agent's builds and tests used the CPU and GPU, so
-the quiet-run guard's interference rejection was disabled; qualified profile: release decoder, affinity 0.08, MTP
-depth 1, 512 tokens x 3; staged prefetch off in every arm because it currently requires exactly 288 experts):
+Speed on a quiet machine (2026-10-12, TR16; qualified profile: release decoder, affinity 0.08, MTP depth 1,
+512 tokens x 3, held-out code prompts; staged prefetch off in every arm because it currently requires exactly
+288 experts). The run guard's quiet-machine rejection was on, except where noted:
 
-| Model | Decode, 8K held-out code (tok/s) | Prefill 8K, single pass (tok/s) | Decode, 2K (tok/s) | Prefill 2K (tok/s) |
+| Model | Decode, 8K (tok/s) | Prefill 8K, single pass (tok/s) | Decode, 2K (tok/s) | Prefill 2K (tok/s) |
 |---|---|---:|---|---:|
-| Q23, 288 experts | 18.6 / 13.1 / 16.6 | 278 | (run rejected: outside GPU job) | — |
-| Q23, 224 experts | 18.7 / 18.8 / 19.1 | 311 | 18.1 / 18.5 / 9.8 | 114 |
-| Q22, 224 experts | 19.8 / 20.1 / 20.1 | 310 | 19.8 / 19.0 / 19.1 | 136 |
+| Q23, 288 experts | 22.4 / 22.0 / 21.8 (see below) | 295 | 22.0 / 22.9 / 20.8 | 107 |
+| Q23, 224 experts | 21.8 / 22.8 / 23.0 | 341 (+16%) | 21.9 / 22.2 / 21.1 | 131 (+22%) |
+| Q22, 224 experts | 23.0 / 23.2 / 23.0 | 351 (+19%) | 22.2 / 22.6 / 23.6 | 141 (+31%) |
 
-Pruning did not slow decode; the 288-expert file, which nearly fills the 125 GB host (it touched swap), was the
-least steady. A clean comparison on a quiet machine is still needed (the clean qualified number for the unpruned
-file is 23.0 tok/s, 2026-10-10, with staged prefetch on). The simulator (`tools/sim`, packs `reap224_q23` / `reap224_q22`) predicts no change
-(−2%, within its error): top-8 routing reads the same bytes per token. Prefill, which streams every expert over PCIe
-per chunk, moves 21% fewer bytes.
+Pruning leaves decode where it was (all three within their trial spread, 21-23 tok/s) and speeds up prefill by
+16-31%, about what 21% fewer expert bytes streamed over PCIe per chunk predicts. The simulator (`tools/sim`,
+packs `reap224_q23` / `reap224_q22`) predicted no decode change (−2%, within its error): top-8 routing reads the
+same bytes per token.
+
+The 288-expert file could not be timed with the guard on. In four attempts its run was stopped at the start of
+decode, either by kernel memory compaction (`kcompactd` at 98% of a core, triggered by the decoder's own
+huge-page arenas with 108 GB resident) or by 46-68 MB of process swap. Its 8K decode above was therefore taken
+with interference recorded and a 512 MB swap allowance: compaction ran at 264-297 s and 228 MB went to swap
+(prefill measured before that). Its 2K run happened to see neither. The pruned files leave 25-33 GB more memory
+free and were not affected. An earlier screen of the same three files while another agent's builds were running
+measured 13-20 tok/s decode, in the same order.
 
 ## Reproduce
 
