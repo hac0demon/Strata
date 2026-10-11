@@ -25,6 +25,15 @@ __global__ void half_cast(const float *x, uint16_t *y, int64_t n) {
     if (i < n)
         y[i] = __half_as_ushort(__float2half(x[i]));
 }
+__device__ uint16_t bf16_bits(float v) {
+    uint32_t u = __float_as_uint(v);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return uint16_t((u >> 16) | 64u);
+    return uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+__global__ void bf16_cast(const float *x, uint16_t *y, int64_t n) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = bf16_bits(x[i]);
+}
 __global__ void gather_half(const float *x, uint16_t *y, const int *routes, int begin,
                             int rows, int width) {
     const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,6 +122,15 @@ __global__ void gather_expert_half(const float *x, uint16_t *y, const int *bound
     const int begin = bounds[expert], end = bounds[expert + 1];
     y[(int64_t)blockIdx.y * rows * width + i] = row < end - begin
         ? __half_as_ushort(__float2half(x[(int64_t)source[begin + row] * width + i % width])) : 0;
+}
+__global__ void gather_expert_bf16(const float *x, uint16_t *y, const int *bounds, const int *source,
+                                  int first, int offset, int rows, int width, unsigned mask) {
+    const int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t)rows * width) return;
+    const int expert = masked_expert(first, mask, blockIdx.y), row = i / width + offset;
+    const int begin = bounds[expert], end = bounds[expert + 1];
+    y[(int64_t)blockIdx.y * rows * width + i] = row < end - begin
+        ? bf16_bits(x[(int64_t)source[begin + row] * width + i % width]) : 0;
 }
 // The same gather from rows already rounded to FP16 (bit-identical to rounding here).
 __global__ void gather_expert_half_input(const uint16_t *x, uint16_t *y, const int *bounds, const int *source,
@@ -513,7 +531,7 @@ kda_rows(float *state, const float *q, const float *k, const float *v, const flo
 }
 // Each output column is independent; retain the original eight/four partial
 // sums and their order while distributing one head across four CTAs.
-template <int parts, bool prepared = false, int cols = 32>
+template <int parts, bool prepared = false, int cols = 32, bool ordered = false>
 __global__ void __launch_bounds__(cols *parts, 1)
     kda_rows_columns(float *state, const float *q, const float *k, const float *v, const float *g,
                      const float *beta, float *out, int heads, int tokens,
@@ -562,15 +580,34 @@ __global__ void __launch_bounds__(cols *parts, 1)
         for (int i = 0; i < rows; ++i) {
             const int row = part * rows + i;
             values[i] *= decay[row];
-            mem += values[i] * kn[row];
+            if constexpr (!ordered) mem += values[i] * kn[row];
         }
-        partial[part * cols + lane] = mem;
+        if constexpr (ordered) {
+            // Carry the original sequential FMA accumulator between row
+            // partitions, rather than adding independently rounded partials.
+            // Each thread keeps 32 state values with four parts.
+            if (!part) partial[lane] = 0.f;
+            __syncthreads();
+#pragma unroll
+            for (int p = 0; p < parts; ++p) {
+                if (part == p) {
+                    float total = partial[lane];
+#pragma unroll
+                    for (int i = 0; i < rows; ++i) total += values[i] * kn[part * rows + i];
+                    partial[lane] = total;
+                }
+                __syncthreads();
+            }
+        } else partial[part * cols + lane] = mem;
         __syncthreads();
         if (!part) {
             float total = 0;
+            if constexpr (ordered) total = partial[lane];
+            else {
 #pragma unroll
             for (int p = 0; p < parts; ++p)
                 total += partial[p * cols + lane];
+            }
             delta[lane] = (v[offset + j] - total) * b;
         }
         __syncthreads();
@@ -579,15 +616,31 @@ __global__ void __launch_bounds__(cols *parts, 1)
         for (int i = 0; i < rows; ++i) {
             const int row = part * rows + i;
             values[i] = values[i] + kn[row] * delta[lane];
-            sum += values[i] * qr[row] * qi;
+            if constexpr (!ordered) sum += values[i] * qr[row] * qi;
         }
-        partial[part * cols + lane] = sum;
+        if constexpr (ordered) {
+            if (!part) partial[lane] = 0.f;
+            __syncthreads();
+#pragma unroll
+            for (int p = 0; p < parts; ++p) {
+                if (part == p) {
+                    float total = partial[lane];
+#pragma unroll
+                    for (int i = 0; i < rows; ++i) total += values[i] * qr[part * rows + i] * qi;
+                    partial[lane] = total;
+                }
+                __syncthreads();
+            }
+        } else partial[part * cols + lane] = sum;
         __syncthreads();
         if (!part) {
             float total = 0;
+            if constexpr (ordered) total = partial[lane];
+            else {
 #pragma unroll
             for (int p = 0; p < parts; ++p)
                 total += partial[p * cols + lane];
+            }
             out[offset + j] = total;
         }
         __syncthreads();
@@ -888,6 +941,19 @@ void glm_f16(const float *x, uint16_t *y, int64_t n, void *s) {
     half_cast<<<(n + 255) / 256, 256, 0, (cudaStream_t)s>>>(x, y, n);
     check();
 }
+void glm_bf16(const float *x, uint16_t *y, int64_t n, void *s) {
+    if (n > 0) bf16_cast<<<(n + 255) / 256, 256, 0, (cudaStream_t)s>>>(x, y, n);
+    check();
+}
+void glm_gather_expert_bf16(const float *x, uint16_t *y, const int *bounds, const int *source,
+                            int first, int groups, int offset, int rows, int width, void *s, unsigned mask) {
+    check_expert_mask(mask, groups);
+    if (first < 0 || groups < 0 || offset < 0 || rows < 0 || width < 1)
+        throw std::invalid_argument("GLM: invalid BF16 expert gather");
+    if (groups && rows) gather_expert_bf16<<<dim3(((int64_t)rows * width + 255) / 256, groups), 256, 0,
+        (cudaStream_t)s>>>(x, y, bounds, source, first, offset, rows, width, mask);
+    check();
+}
 void glm_resident_routes(const int *ids, const unsigned long long *lookup,
                           unsigned long long *ptr, int *starts, int *dest,
                           int *tokens, int *count, void *s) {
@@ -1039,13 +1105,24 @@ void glm_kda_chunk(float *state, const float *q, const float *k, const float *v,
                    const float *b, float *out, int heads, int dim, int tokens, void *s, int columns,
                    int row_parts, const float *prepared_qi, float *snapshots, long long snapshot_stride,
                    int snapshot_tokens) {
-    if (dim != 128 || tokens < 1 || tokens > 64)
+    if (dim != 128 || tokens < 1 || tokens > 2048)
         throw std::invalid_argument("GLM: invalid KDA chunk");
     if (snapshots && (row_parts != 1 || prepared_qi))
         throw std::invalid_argument("GLM: KDA snapshots need the column kernel");
     if (row_parts != 1) {
         if (columns != 128 || (row_parts != 4 && row_parts != 8))
             throw std::invalid_argument("GLM: parallel KDA needs 128 columns and 4 or 8 row parts");
+        const char *ordered = std::getenv("STRATA_GLM_KDA_ORDERED_ROWS");
+        if (ordered && std::string(ordered) != "0") {
+            if (std::string(ordered) != "1" || row_parts != 4)
+                throw std::invalid_argument("GLM: ordered KDA rows require value 1 and four row parts");
+            const dim3 grid(heads, 4);
+            if (prepared_qi)
+                kda_rows_columns<4, true, 32, true><<<grid, 128, 0, (cudaStream_t)s>>>(state, q, k, v, g, b, out, heads, tokens, prepared_qi);
+            else
+                kda_rows_columns<4, false, 32, true><<<grid, 128, 0, (cudaStream_t)s>>>(state, q, k, v, g, b, out, heads, tokens);
+            check(); return;
+        }
         if (std::getenv("STRATA_GLM_KDA_COLUMN_TILES")) {
             const dim3 grid(heads, 4);
             if (prepared_qi) {

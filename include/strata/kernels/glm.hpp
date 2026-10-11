@@ -11,6 +11,9 @@ void glm_rms_norm(const float *x, const float *weight, float *y, int width, int 
 // so a caller uses one or the other for every width it must keep consistent.
 void glm_rms_norm_rows(const float *x, const float *weight, float *y, int width, int tokens, float eps,
                        void *stream);
+// Aligned rows, width divisible by 32: normalized floats and native Q8_1 activation blocks in one launch.
+void glm_rms_norm_rows_q8(const float *x, const float *weight, float *y, void *q8, int width, int tokens,
+                         float eps, void *stream);
 void glm_layer_norm(const float *x, const float *weight, const float *bias, float *y, int width, float eps,
                     void *stream);
 void glm_swiglu(const float *gate, const float *up, float *y, int count, float limit, void *stream);
@@ -37,6 +40,10 @@ void glm_mhc_read_tokens(const float *streams, const float *projected, const flo
                          void *stream);
 void glm_mhc_write_tokens(const float *streams, const float *coefficients, const float *y, float *out, int width,
                           int tokens, void *stream);
+// Same arithmetic; additionally save tokens*24 coefficients in a distinct device buffer.
+// Saves a separate device copy for deferred experts. Streams/out may alias; saved must not alias any input.
+void glm_mhc_write_tokens_save(const float *streams, const float *coefficients, const float *y, float *out,
+                               float *saved, int width, int tokens, void *stream);
 // Router for several tokens: logits + t*experts, ids/weights + t*top_k.
 void glm_router_tokens(const float *logits, const float *correction, int *ids, float *weights, int experts,
                        int top_k, float scale, int tokens, void *stream, const float *bonus = nullptr);

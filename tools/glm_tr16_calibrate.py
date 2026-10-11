@@ -118,6 +118,8 @@ def command(c, prompt, tokens, trials):
            '--bench=' + str(max(2, trials)), '--decode-bench=' + str(trials + 1),
            '--decode-cache-mib=' + str(c['decode_cache_mib']),
            '--prefill-experts=' + c.get('prefill_experts', 'mmq')]
+    if c.get('decode_cache_slots'):   # opt-in: pin the tier's slot count (comparisons independent of free VRAM)
+        cmd.append('--decode-cache-slots=' + str(int(c['decode_cache_slots'])))
     if c.get('decode_graphs'):
         cmd.append('--decode-graphs')
     if c.get('expert_pack'):

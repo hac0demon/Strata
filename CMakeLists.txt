@@ -652,9 +652,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_HIP)
     # #313: the RDNA3 WMMA GEMMs include hip_runtime.h: AMD builds only (a CUDA build never sees this file)
     target_sources(strata_prefill PRIVATE src/prefill/wmma_gemm.cu)
+    target_sources(strata_prefill PRIVATE src/prefill/wmma_gfx12.cu)
+    foreach(_arch IN LISTS CMAKE_HIP_ARCHITECTURES)
+      if(_arch MATCHES "^gfx120[01](:|$)")
+        target_compile_definitions(strata_prefill PRIVATE STRATA_WMMA_GFX12=1)
+      endif()
+    endforeach()
   endif()
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  if(STRATA_BUILD_TESTS)
+    add_executable(glm_bf16_prefill_test src/prefill/glm_bf16_prefill_test.cu)
+    target_link_libraries(glm_bf16_prefill_test PRIVATE strata_prefill strata_kernels)
+    if(STRATA_ENABLE_HIP AND CMAKE_HIP_ARCHITECTURES MATCHES "gfx120[01]")
+      add_test(NAME glm_bf16_prefill_test COMMAND glm_bf16_prefill_test --wmma)
+      set_tests_properties(glm_bf16_prefill_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+  endif()
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
     target_compile_definitions(strata_prefill PRIVATE STRATA_HIPBLASLT_AVAILABLE=1)
     target_link_libraries(strata_prefill PRIVATE roc::hipblaslt)
@@ -1213,8 +1227,13 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
+target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+# The pool's canonical reduction is linked even with native experts disabled.
+if(NOT MSVC)
+  set_source_files_properties(src/kernels/cpu/canon_expert.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-ffp-contract=off")
+endif()
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
 if(MSVC)
@@ -1319,8 +1338,8 @@ if(STRATA_NATIVE_EXPERTS)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/q23_avx2.cpp src/kernels/cpu/q23_packed.cpp
-                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/canon_expert.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp)
+                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/q23_avx2.cpp src/kernels/cpu/q23_packed.cpp
+                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp)
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1343,8 +1362,6 @@ if(STRATA_NATIVE_EXPERTS)
     set_source_files_properties(src/kernels/cpu/kq_avx1.cpp PROPERTIES COMPILE_OPTIONS "-mavx")
     set_source_files_properties(src/kernels/cpu/q23_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/kernels/cpu/q23_packed.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    # Canonical expert arithmetic: products are rounded before they are added, as the CUDA kernels do.
-    set_source_files_properties(src/kernels/cpu/canon_expert.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-ffp-contract=off")
     # the older CPUs' Q2_0 rows and activation quantizer (q2_avx1.cpp, issue #1699): SSE4.2 + AVX with
     # AVX2/FMA/F16C explicitly off, so a -march=native build host cannot leak AVX2 code into the file that
     # runs on a Sandy Bridge Xeon
