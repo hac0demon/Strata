@@ -1,8 +1,13 @@
 import unittest
-from glm_coding_perf_matrix import aggregate, length_summary, validate_configs
+from glm_coding_perf_matrix import FAULT, aggregate, length_summary, validate_configs
 
 
 class CodingMatrixTest(unittest.TestCase):
+    def test_kernel_command_line_is_not_a_vm_fault(self):
+        self.assertIsNone(FAULT.search('BOOT_IMAGE=/boot/vmlinuz-7.0 default_hugepagesz=1G'))
+        self.assertIsNotNone(FAULT.search('amdgpu: VM fault at address 0x1234'))
+        self.assertIsNotNone(FAULT.search('amdgpu: GPU reset begin!'))
+
     def test_frozen_routing_and_weights_are_enforced(self):
         control=dict(model='model',expert_pack='pack',env={'STRATA_GLM_ROUTE_AFFINITY':'0.08'})
         validate_configs([('control',control),('candidate',{**control,'speculative':'mtp'})])

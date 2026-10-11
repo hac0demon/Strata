@@ -319,9 +319,14 @@ def worker(args):
     if "decode_cache_window" in cfg:
         command.append("--decode-cache-window=" + str(cfg["decode_cache_window"]))
     for name in cfg.get("decode_checks", []):
-        if name not in ("verify", "verify_graphs", "decode_graphs"):
+        if name not in ("verify", "verify_graphs", "decode_graphs", "eval_stream"):
             raise ValueError("unknown decoder validation check: " + str(name))
         command.append("--check-" + name.replace("_", "-"))
+    if cfg.get('mtp_greedy_control'):
+        if args.single or args.eval_corpus or cfg.get('speculative','none')!='none':
+            raise ValueError('MTP greedy control requires an ordinary generation benchmark')
+        command += ['--speculative=mtp','--mtp-experts=cpu','--draft-depth='+str(cfg.get('draft_depth',1)),
+                    '--mtp-greedy-control']
     if not args.single and not args.eval_corpus and cfg.get("speculative") == "mtp":
         command += ["--speculative=mtp", "--mtp-experts=cpu", "--draft-depth=" + str(cfg.get("draft_depth", 2))]
     if not args.single and not args.eval_corpus and cfg.get("speculative") == "lookup":

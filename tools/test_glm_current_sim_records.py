@@ -39,6 +39,14 @@ class ImportCurrentRun(unittest.TestCase):
     def test_heldout_routing_cannot_leak_into_fit(self):
         with self.assertRaises(ValueError):self.read(self.record(),observed=True,fit=True)
 
+    def test_fault_traces_cannot_be_used_as_performance_training(self):
+        for name,value in [('STRATA_GLM_TASK_TRACE','/tmp/engine.jsonl'),
+                           ('STRATA_GLM_TASK_TRACE_SYNC','1')]:
+            row=self.record();row['config']['env'][name]=value
+            with self.assertRaisesRegex(ValueError,'instrumented'):
+                self.read(row,fit=True)
+            self.assertFalse(self.read(row,components=True)[0]['fit'])
+
     def test_incomplete_or_dirty_runs_are_rejected(self):
         for key,value in [('complete',False),('clean',False),('exit_code',1),('rejected','GPU probe failure')]:
             row=self.record();row[key]=value

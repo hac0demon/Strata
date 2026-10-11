@@ -77,6 +77,50 @@
 namespace {
 namespace k = strata::kernels;
 namespace cpu = k::cpu;
+bool hc_fused_enabled() {
+    static const bool enabled = [] { const char *value = std::getenv("STRATA_GLM_HC_FUSED");
+        return value && value[0] == '1'; }();
+    return enabled;
+}
+bool hc_fused_batch_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("STRATA_GLM_HC_FUSED_BATCH");
+        if (!value || std::string(value) == "0") return false;
+        if (std::string(value) == "1") return true;
+        throw std::invalid_argument("GLM: fused mHC batch must be 0 or 1");
+    }();
+    return enabled;
+}
+bool heads_blocks_batch_matches() {
+    static const bool matches = [] {
+        const char *heads = std::getenv("STRATA_GLM_HEADS_BLOCKS");
+        const char *batch = std::getenv("STRATA_GLM_HEADS_BLOCKS_BATCH");
+        if (batch && std::string(batch) != "0" && std::string(batch) != "1")
+            throw std::invalid_argument("GLM: heads batch blocks must be 0 or 1");
+        return !heads || std::string(heads) != "1" || (batch && std::string(batch) == "1");
+    }();
+    return matches;
+}
+// Opt-in fault breadcrumbs. Default runs do not open a file or synchronize.
+void task_trace(const char *phase, int position, int tokens, int layer = -1) {
+    static const char *path = std::getenv("STRATA_GLM_TASK_TRACE");
+    if (!path || !*path) return;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    std::ofstream out(path, std::ios::app);
+    if (!out) throw std::runtime_error("GLM: cannot open task trace");
+    out << "{\"unix_ms\":" << std::chrono::duration_cast<std::chrono::milliseconds>(now).count()
+        << ",\"phase\":\"" << phase << "\",\"position\":" << position
+        << ",\"tokens\":" << tokens << ",\"layer\":" << layer << "}\n";
+    out.flush();
+    if (!out) throw std::runtime_error("GLM: cannot write task trace");
+#ifdef __linux__
+    const int fd = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("GLM: cannot open task trace for sync");
+    const int rc = ::fsync(fd);
+    ::close(fd);
+    if (rc) throw std::runtime_error("GLM: cannot sync task trace");
+#endif
+}
 // rocBLAS does not implement HIPBLAS_PEDANTIC_MATH. Its default FP32 SGEMM
 // path is the supported HIP mode; CUDA keeps its existing pedantic setting.
 #ifdef STRATA_USE_HIP
@@ -583,6 +627,7 @@ struct GpuPrefill {
     }();
     // Groups uploaded during the preceding mixer: (layer, group) -> pool index.
     static inline size_t prefetch_bytes = 0;
+    static inline int prefetch_group_limit = 18;
     static int prefetch_groups() {
         const char *value = std::getenv("STRATA_GLM_PREFETCH_GROUPS");
         if (!value) return 0;
@@ -604,6 +649,10 @@ struct GpuPrefill {
     }
     void prefetch(const strata::core::ArtifactTensor &G, const strata::core::ArtifactTensor &U,
                   const strata::core::ArtifactTensor &D, int layer, int group, int index, size_t stride) {
+        const size_t experts = G.tensor->shape[2];
+        if (!experts || experts % 16 || U.tensor->shape[2] != experts || D.tensor->shape[2] != experts ||
+            group < 0 || size_t(group) >= experts / 16 || index < 0 || size_t(index) >= pool.size())
+            throw std::out_of_range("GLM: invalid prefetch group or pool index");
         const size_t gh = G.bytes / G.tensor->shape[2], db = D.bytes / D.tensor->shape[2], bytes = 16 * stride;
         if (bytes + 16384 > pool[index]->bytes) throw std::runtime_error("GLM: native expert group exceeds prefetch slot");
         auto *p = (char *)pool[index]->p;
@@ -720,7 +769,7 @@ struct GpuPrefill {
             check(cudaEventRecord(done[i], (cudaStream_t)stream));
         }
         if ((direct_upload || staged_prefetch) && prefetch_bytes)
-            for (int i = 0; i < prefetch_groups(); ++i) {
+            for (int i = 0; i < std::min(prefetch_groups(), prefetch_group_limit); ++i) {
                 pool.push_back(std::make_unique<Device>(prefetch_bytes));
                 pool_ready.emplace_back(); pool_done.emplace_back();
                 check(cudaEventCreateWithFlags(&pool_ready[i], cudaEventDisableTiming));
@@ -1668,6 +1717,15 @@ class Decoder {
     bool tensor_prefill_experts = false;
     bool tensor_batched_experts = false;
     bool tensor_prefill_bf16 = false;
+    const bool reap_prefetch = [] {
+        const char *value = std::getenv("STRATA_GLM_REAP_PREFETCH");
+        if (!value || std::string(value) == "0") return false;
+        if (std::string(value) == "1") return true;
+        throw std::invalid_argument("GLM: REAP prefetch must be 0 or 1");
+    }();
+    bool prefetch_geometry_supported() const {
+        return m.experts == 288 || (reap_prefetch && m.experts == 144);
+    }
     const bool bf16_wmma = [] { const char *v = std::getenv("STRATA_GLM_BF16_WMMA"); return v && std::string(v) == "1"; }();
     const int f16_prefill_min_tokens = [] {
         const char *value = std::getenv("STRATA_GLM_F16_PREFILL_MIN_TOKENS");
@@ -3027,14 +3085,19 @@ class Decoder {
         // STRATA_GLM_HC_FUSED=1 (opt-in, decode of one token with the Q8 projection): norm, projection, Sinkhorn
         // coefficients and the read in two launches instead of five; the norm scale is applied after the projection,
         // so rounding differs from the unfused path.
-        static const bool hc_fused = [] { const char *v = std::getenv("STRATA_GLM_HC_FUSED"); return v && v[0] == '1'; }();
-        if (hc_fused && !fast && batch_tokens == 1 && floating_q8_weight(p + "hc_" + kind + "_fn.weight")) {
+        if (hc_fused_enabled() && !fast && (batch_tokens == 1 || hc_fused_batch_enabled()) &&
+            batch_tokens <= cpu::MAXT && floating_q8_weight(p + "hc_" + kind + "_fn.weight")) {
             auto &fb = weight(p + "hc_" + kind + "_base.weight");
             auto &fs = weight(p + "hc_" + kind + "_scale.weight");
             auto &qw = weight(p + "hc_" + kind + "_fn.weight");
             auto &partial = buf("hc_fused_partial", 25 * 32);
-            k::glm_hc_read_fused(qw.p, r, fb.f(), fs.f(), c, x, partial.f(), m.hidden, m.sinkhorn_iterations,
-                                 m.hc_epsilon, m.rms_epsilon, stream);
+            // The single-row fusion deliberately applies normalization after
+            // projection. Reuse exactly that arithmetic for each verify row;
+            // scratch reuse is ordered on the same stream.
+            for (int t = 0; t < batch_tokens; ++t)
+                k::glm_hc_read_fused(qw.p, r + (size_t)t * 4 * m.hidden, fb.f(), fs.f(), c + t * 24,
+                                     x + (size_t)t * m.hidden, partial.f(), m.hidden, m.sinkhorn_iterations,
+                                     m.hc_epsilon, m.rms_epsilon, stream);
             return;
         }
         // STRATA_GLM_HC_NORM_ROWS=1 (opt-in): the mHC norm over 4 x hidden values takes the 1024-thread rows kernel
@@ -3243,7 +3306,7 @@ class Decoder {
         if (prefetch_pending.valid()) prefetch_pending.get();
     }
     void prefetch_groups_sync(int layer_id) {
-        if (!fast || !gpu || gpu->pool.empty() || m.experts != 288) return;
+        if (!fast || !gpu || gpu->pool.empty() || !prefetch_geometry_supported()) return;
         const auto p = "blk." + std::to_string(layer_id) + ".";
         const auto &G = artifact.at(p + "ffn_gate_exps.weight");
         const auto &U = artifact.at(p + "ffn_up_exps.weight");
@@ -3266,7 +3329,7 @@ class Decoder {
     }
     void prefetch_groups(int layer_id) {
         finish_prefetch();
-        if (!fast || !gpu || gpu->pool.empty() || m.experts != 288) return;
+        if (!fast || !gpu || gpu->pool.empty() || !prefetch_geometry_supported()) return;
         if (!gpu->staged_prefetch) { prefetch_groups_sync(layer_id); return; }
         if (!prefetch_launcher) prefetch_launcher = std::make_unique<GpuWorker>(primary_device);
         // Enqueue the mixer on the main thread while the staging worker fills
@@ -5974,6 +6037,15 @@ class Decoder {
           budget(cache_bytes) {
         if (m.experts % 16 || m.experts > 288) throw std::invalid_argument("GLM: expert count must be a multiple of 16, at most 288");
         prefill_expert_groups = (int)m.experts / 16;
+        if (reap_prefetch && (artifact.is_exl3() || m.experts != 144 || direct_upload_enabled() ||
+                             !std::getenv("STRATA_GLM_STAGE_PREFETCH") ||
+                             std::string(std::getenv("STRATA_GLM_STAGE_PREFETCH")) != "1"))
+            throw std::invalid_argument("GLM: REAP prefetch requires 144 GGUF experts, staged prefetch and no direct upload");
+        GpuPrefill::prefetch_group_limit = reap_prefetch ? prefill_expert_groups : 18;
+        if (reap_prefetch) {
+            GpuPrefill::prefetch_bytes = 0;
+            std::cerr << "PREFETCH_REAP experts=" << m.experts << " maximum_groups=" << prefill_expert_groups << '\n';
+        }
         for (size_t l = 0; l < m.layers.size(); ++l) {
             if (m.layers[l].ffn != strata::core::FfnKind::Moe) continue;
             const auto p = "blk." + std::to_string(l) + ".";
@@ -6038,7 +6110,7 @@ class Decoder {
             if(expert_bytes)throw std::invalid_argument("EXL3: GGUF expert cache is unsupported");
             exl_pool=std::make_unique<strata::cpu::exl3::Pool>(threads,pin_cpu);
         }
-        if (!artifact.is_exl3() && GpuPrefill::prefetch_groups() && m.experts == 288)
+        if (!artifact.is_exl3() && GpuPrefill::prefetch_groups() && prefetch_geometry_supported())
             for (size_t l = 0; l < m.layers.size(); ++l) {
                 if (m.layers[l].ffn != strata::core::FfnKind::Moe) continue;
                 const auto p = "blk." + std::to_string(l) + ".";
@@ -6230,7 +6302,10 @@ class Decoder {
             }
         }
     }
-    std::vector<float> batch(const std::vector<int> &tokens, bool prefill = true, bool all_logits = false) {
+    std::vector<float> batch(const std::vector<int> &tokens, bool prefill = true, bool all_logits = false,
+                            const std::function<void(const float *, int, int)> &consume_logits = {}) {
+        if (consume_logits && (!all_logits || artifact.is_exl3()))
+            throw std::invalid_argument("GLM: streamed logits require all GGUF rows");
         if (!prefill) finish_prefill_repairs();
         if (decode_cache_adapt) for (int i = 0; i < 2; ++i) finish_copy(i);
         fast = gpu && prefill;
@@ -6242,6 +6317,19 @@ class Decoder {
             if (token < 0 || token >= m.vocab || (artifact.is_exl3()&&!artifact.exl3().token_ids[token]))
                 throw std::out_of_range("GLM: token or context out of range");
         batch_tokens = nt;
+        task_trace(prefill ? "prefill_batch_begin" : "decode_batch_begin", position, nt);
+        const bool trace_prefill = fast && std::getenv("STRATA_GLM_TASK_TRACE");
+        const char *trace_sync_value = std::getenv("STRATA_GLM_TASK_TRACE_SYNC");
+        const bool trace_sync = trace_prefill && trace_sync_value && std::string(trace_sync_value) == "1";
+        auto prefill_trace = [&](const char *phase, int layer) {
+            if (!trace_prefill) return;
+            task_trace(phase, position, nt, layer);
+        };
+        auto prefill_complete = [&](const char *phase, int layer) {
+            if (!trace_prefill) return;
+            if (trace_sync) check(cudaStreamSynchronize(stream));
+            prefill_trace(phase, layer);
+        };
         if (fast && tensor_prefill_experts && f16_prefill_min_tokens)
             std::cerr << "PREFILL_EXPERT_SELECT tokens=" << nt << " backend="
                       << (use_tensor_prefill_experts() ? (tensor_prefill_bf16 ? "bf16-batched" : tensor_batched_experts ? "f16-batched" : "f16") : "mmq")
@@ -6363,6 +6451,7 @@ class Decoder {
         // GPU waits for this thread's CPU experts.
         auto enqueue_layers = [&] {
         for (size_t l = 0; l < m.layers.size(); ++l) {
+            prefill_trace("layer_begin", (int)l);
             const std::string p = "blk." + std::to_string(l) + ".";
             const auto &layer = m.layers[l];
             check_stop();
@@ -6459,6 +6548,7 @@ class Decoder {
             if (profile)
                 check(cudaStreamSynchronize(stream));
             auto mixer_end = std::chrono::steady_clock::now();
+            prefill_complete("mixer_complete", (int)l);
             flush_deferred(c.f());  // after this layer's mixer write, as in the combined path
             reset_phase();
             if (combined) {
@@ -6477,6 +6567,7 @@ class Decoder {
                 moe(p, l, x.f(), y.f(), layer);
                 if (!fast) trace_done();
             }
+            prefill_complete("ffn_complete", (int)l);
             if (fast)
                 k::glm_mhc_write_batch(r.f(), c.f(), y.f(), r.f(), m.hidden, nt, stream);
             else if (defer_active && pipelining && layer.ffn == strata::core::FfnKind::Moe && mhc_save_fused)
@@ -6669,6 +6760,7 @@ class Decoder {
         if (split) { ++split_windows; run_pipelined_step(enqueue_split, split); }
         else if (pipelining) run_pipelined_step(enqueue_layers);
         else enqueue_layers();
+        prefill_trace("output_head_begin", -1);
         if (capture_hidden && !row_sequences.empty()) {
             for (int t = 0; t < nt; ++t) {
                 auto &hidden = row_sequences[t] == current_sequence ? target_hidden : sequences[row_sequences[t]].hidden;
@@ -6683,12 +6775,24 @@ class Decoder {
             if (fast && mtp_batched) mtp_prime_batch(tokens, x.f());
         }
         const int head_tokens = all_logits ? nt : 1;
-        auto &logits = buf("output", (size_t)m.vocab * head_tokens);
+        // Prefill evaluation otherwise materializes ~4.7 GiB of logits at 8K.
+        // Stream the same MAXT head panels to the scorer when requested; normal
+        // decoding and verification retain their existing allocation and result.
+        auto &logits = buf("output", (size_t)m.vocab * (consume_logits ? std::min(cpu::MAXT, head_tokens) : head_tokens));
         // Evaluation can request every prefill row. Native decode projections
         // accept at most MAXT columns; keep their arithmetic for each small panel.
-        for (int first = 0; first < head_tokens; first += cpu::MAXT)
+        for (int first = 0; first < head_tokens; first += cpu::MAXT) {
+            const int count = std::min(cpu::MAXT, head_tokens - first);
             mat("output.weight", x.f((size_t)(all_logits ? first : nt - 1) * m.hidden),
-                logits.f((size_t)first * m.vocab), false, std::min(cpu::MAXT, head_tokens - first));
+                logits.f((size_t)(consume_logits ? 0 : first) * m.vocab), false, count);
+            if (consume_logits) {
+                check(cudaStreamSynchronize(stream));
+                auto panel = logits.floats((size_t)m.vocab * count);
+                for (float value : panel)
+                    if (!std::isfinite(value)) throw std::runtime_error("GLM: non-finite streamed logits");
+                consume_logits(panel.data(), first, count);
+            }
+        }
         const bool trace_tail = step_trace && !fast && trace.any;
         auto tail_mark = std::chrono::steady_clock::now();
         auto tail_part = [&](double &part) {
@@ -6698,6 +6802,7 @@ class Decoder {
             tail_mark = now;
         };
         check(cudaStreamSynchronize(stream));
+        task_trace(prefill ? "prefill_gpu_complete" : "decode_gpu_complete", position, nt);
         tail_part(trace.sync_ms);
         if (pipelining) {
             pipelining = false;
@@ -6710,7 +6815,7 @@ class Decoder {
         tail_part(trace.plan_ms);
         position += nt;
         batch_tokens = 1;
-        auto result = logits.floats((size_t)m.vocab * head_tokens);
+        auto result = consume_logits ? std::vector<float>{} : logits.floats((size_t)m.vocab * head_tokens);
         for (float v : result)
             if (!std::isfinite(v))
                 throw std::runtime_error("GLM: non-finite logits");
@@ -6724,6 +6829,7 @@ class Decoder {
             trace.tail_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - trace.last_done).count();
             ++trace.steps;
         }
+        task_trace(prefill ? "prefill_batch_complete" : "decode_batch_complete", position, nt);
         return result;
     }
     void begin_sequence_window() {
@@ -6897,7 +7003,8 @@ class Decoder {
     int vocabulary() const { return m.vocab; }
     bool external_batch_exact() const {
         return canon_experts && canon_strict() && !has_route_affinity() && !defer_experts &&
-               !ram_tier && !remote_tp && !multi_upstream && !gpu_decode_experts;
+               !ram_tier && !remote_tp && !multi_upstream && !gpu_decode_experts &&
+               (!hc_fused_enabled() || hc_fused_batch_enabled()) && heads_blocks_batch_matches();
     }
     void flush_expert_observer(){if(expert_observer)expert_observer->flush();if(block_screen)block_screen->report(std::cerr);}
     void set_block_screen_budget(int keep){if(!block_screen)throw std::invalid_argument("block sweep requires a screen profile");block_screen->uniform_budget(keep);}
@@ -8701,10 +8808,11 @@ static void evaluate_corpus(Decoder& decoder,const std::string& corpus,const std
         if (eval_width < 1 || eval_width > (size_t)cpu::MAXT) throw std::invalid_argument("STRATA_GLM_EVAL_WIDTH must be 1..8");
         const size_t width = prefill_chunk ? prefill_chunk : eval_width;
         for(size_t start=0;start+1<ids.size();start+=width) {
-            const size_t end=std::min(start+width,ids.size()-1);auto logits=decoder.batch(std::vector<int>(ids.begin()+start,ids.begin()+end),prefill_chunk != 0,true);
-            if(start==0)lock_small_runtime_mappings();
-            for(size_t t=0;t<end-start;++t) {
-                const auto* row=logits.data()+t*vocab;const double maximum=*std::max_element(row,row+vocab);double sum=0;
+            const size_t end=std::min(start+width,ids.size()-1);
+            auto score = [&](const float* panel, int first, int rows) {
+            for(int local=0;local<rows;++local) {
+                const size_t t=first+local;
+                const auto* row=panel+(size_t)local*vocab;const double maximum=*std::max_element(row,row+vocab);double sum=0;
                 for(int k=0;k<vocab;++k){if(!std::isfinite(row[k]))throw std::runtime_error("nonfinite evaluation logits");sum+=std::exp(double(row[k])-maximum);}const double logz=maximum+std::log(sum);
                 nll+=logz-row[ids[start+t+1]];++count;
                 if(saved.is_open()){saved.write(reinterpret_cast<const char*>(row),vocab*4);if(!saved)throw std::runtime_error("evaluation logits write failed");}
@@ -8715,6 +8823,14 @@ static void evaluate_corpus(Decoder& decoder,const std::string& corpus,const std
                     top1+=(std::max_element(row,row+vocab)-row)==(std::max_element(base.begin(),base.end())-base.begin());
                 }
             }
+            };
+            const std::vector<int> window(ids.begin()+start,ids.begin()+end);
+            if(prefill_chunk)decoder.batch(window,true,true,score);
+            else {
+                const auto logits=decoder.batch(window,false,true);
+                score(logits.data(),0,(int)(end-start));
+            }
+            if(start==0)lock_small_runtime_mappings();
         }
         ++sequence;std::cout<<"{\"sequence\":"<<sequence<<",\"tokens\":"<<count<<",\"nll\":"<<std::setprecision(12)<<nll/count<<",\"perplexity\":"<<std::exp(nll/count);
         if(reference.is_open())std::cout<<",\"kl\":"<<kl/count<<",\"top1_agreement\":"<<double(top1)/count<<",\"different_logits\":"<<different_logits;
@@ -8796,6 +8912,10 @@ static LookupStats generate_lookup(Decoder &decoder, std::vector<float> &logits,
                                    strata::spec::ExternalWorker *external = nullptr) {
     if (external && !decoder.external_batch_exact())
         return generate_external_sequential(decoder,logits,prompt,max_new,stops,depth,emit,report,*external);
+    if (!external && hc_fused_enabled() && !hc_fused_batch_enabled())
+        throw std::invalid_argument("GLM: fused mHC lookup needs STRATA_GLM_HC_FUSED_BATCH=1 for matching verification arithmetic");
+    if (!external && !heads_blocks_batch_matches())
+        throw std::invalid_argument("GLM: blocked-head lookup needs STRATA_GLM_HEADS_BLOCKS_BATCH=1 for matching verification arithmetic");
     const auto start = std::chrono::steady_clock::now();
     auto elapsed = [](auto begin) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count(); };
     double draft_ms = 0, verify_ms = 0, restore_ms = 0;
@@ -8901,6 +9021,10 @@ static LookupStats generate_mtp(Decoder &decoder, std::vector<float> &logits, in
                                const std::vector<int> &stops, int depth,
                                const std::function<void(int)> &emit,
                                const std::vector<int> *prompt = nullptr) {
+    if (hc_fused_enabled() && !hc_fused_batch_enabled())
+        throw std::invalid_argument("GLM: fused mHC MTP needs STRATA_GLM_HC_FUSED_BATCH=1 for matching verification arithmetic");
+    if (!heads_blocks_batch_matches())
+        throw std::invalid_argument("GLM: blocked-head MTP needs STRATA_GLM_HEADS_BLOCKS_BATCH=1 for matching verification arithmetic");
     const auto start = std::chrono::steady_clock::now();
     auto checkpoint = decoder.checkpoint();
     // The first proposal already advanced the draft block with exactly the anchor's resync inputs (the
@@ -9459,13 +9583,13 @@ int main(int argc, char **argv) {
         int prefill_batch = 8;
         size_t gpu_budget = 12288 * MiB;
         bool force_gpu = false, warm_weights = false, lock_weights = false, profile = false;
-        bool profile_prefill = false, profile_decode = false, decode_graphs = false, check_decode_graphs = false, check_verify_graphs=false, decode_cache_adapt = false;
+        bool profile_prefill = false, profile_decode = false, decode_graphs = false, check_decode_graphs = false, check_eval_stream=false, check_verify_graphs=false, decode_cache_adapt = false;
         int decode_cache_window = 256;
         int repetitions = 1, context = 0, reference_batch = 1, lookup_depth = 0;
         bool check_verify = false, stream_decode = false, pin_cpu = false, use_mtp = false;
         bool mtp_cpu_experts = false, decode_prefill_cache = false, decode_cache_auto = false, decode_cache_extend = false;
         int draft_depth = 3, decode_repetitions = 1;
-        bool decode_mode_sweep = false, decode_mtp_sweep = false;
+        bool decode_mode_sweep = false, decode_mtp_sweep = false, mtp_greedy_control = false;
         size_t cpu_prepack_mib = 0, prefill_cache_bytes = 0;
         bool prefill_cache_auto = false, check_gpu_split = false, tensor_experts = false, tensor_batches = false;
         bool tensor_bf16 = false;
@@ -9493,6 +9617,7 @@ int main(int argc, char **argv) {
             else if (flag == "--prefill-experts=mmq") tensor_experts = tensor_batches = tensor_bf16 = false;
             else if (flag == "--decode-cache-adapt") decode_cache_adapt = true;
             else if (flag == "--check-decode-graphs") { check_decode_graphs = true; force_gpu = true; }
+            else if (flag == "--check-eval-stream") { check_eval_stream = true; force_gpu = true; }
             else if (flag.starts_with("--decode-cache-window=")) decode_cache_window = std::stoi(flag.substr(22));
             else if (flag == "--decode-graphs") { decode_graphs = true; force_gpu = true; }
             else if (flag.starts_with("--remote-tp=")) remote_tp_address = flag.substr(12);
@@ -9536,6 +9661,7 @@ int main(int argc, char **argv) {
             else if (flag.starts_with("--draft-depth=")) draft_depth = std::stoi(flag.substr(14));
             else if (flag == "--decode-mode-sweep") decode_mode_sweep = true;
             else if (flag == "--decode-mode-sweep=mtp") decode_mode_sweep = decode_mtp_sweep = true;
+            else if (flag == "--mtp-greedy-control") mtp_greedy_control = true;
             else if (flag.starts_with("--decode-bench=")) decode_repetitions = std::stoi(flag.substr(15));
             else if (flag == "--speculative=lookup")
                 lookup_depth = 3;
@@ -9618,6 +9744,8 @@ int main(int argc, char **argv) {
                 throw std::invalid_argument("--decode-mode-sweep requires a GGUF CPU target with no other speculative, cache, or parity mode");
             use_mtp = force_gpu = true;
         }
+        if (mtp_greedy_control && (!use_mtp || lookup_depth || decode_mode_sweep || !eval_corpus.empty()))
+            throw std::invalid_argument("--mtp-greedy-control requires an ordinary MTP benchmark setup");
         const auto devices = configure_devices(gpu_devices_text, gpu_budget);
         if (check_gpu_split && (devices.size() != 2 || use_mtp || replay || check_prefill))
             throw std::invalid_argument("--check-gpu-split needs two GPUs, single decode, and no other parity mode");
@@ -9673,18 +9801,22 @@ int main(int argc, char **argv) {
             if(block_screen_sweep.empty())throw std::invalid_argument("layer sensitivity requires block sweep budgets");
             std::set<int> unique;for(int layer:block_screen_layers)if(layer<3||layer>44||!unique.insert(layer).second)throw std::invalid_argument("block sensitivity layers must be distinct integers in 3..44");
         }
+        task_trace("model_load_begin", 0, (int)tokens.size());
         Decoder decoder(argv[1], context ? context : tokens.size() + steps, (size_t)mib * 1024 * 1024,
                         threads, (size_t)expert_mib * 1024 * 1024, pin_cpu,expert_pack_path,expert_pack_profile,cpu_expert_backend);
+        task_trace("model_load_complete", 0, (int)tokens.size());
         if (check_sequence_count) decoder.enable_sequences(check_sequence_count);
         if(check_native_dense_q8) {
             if((context ? size_t(context) : tokens.size()+steps)<tokens.size()+8)
                 throw std::invalid_argument("--check-native-dense-q8 requires native EXL3 and eight available positions");
             decoder.set_native_dense_q8(true);
         }
+        task_trace("gpu_setup_begin", 0, prefill_batch);
         if (prefill_batch == 0 || prefill_batch > cpu::MAXT || force_gpu)
             prefill_batch = decoder.enable_gpu(prefill_batch, gpu_budget, lookup_depth > 0 || check_verify || check_decode_graphs);
         if (direct_upload_enabled()) decoder.warm_weights(true, devices);
         decoder.configure_prefill(devices, gpu_budget, prefill_cache_bytes, prefill_cache_auto, use_mtp, tensor_experts, tensor_batches, tensor_bf16);
+        task_trace("gpu_setup_complete", 0, prefill_batch);
         decoder.set_gpu_decode_experts(stream_decode);
         if (decode_prefill_cache && (cpu_prepack_mib || expert_mib))
             throw std::invalid_argument("GLM: decode prefill cache cannot be combined with CPU prepacking or legacy expert cache");
@@ -9788,9 +9920,15 @@ int main(int argc, char **argv) {
                                           : "batched prefill state and logits passed parity\n");
         } else {
             using Clock = std::chrono::steady_clock;
+            const char *repeat_check = std::getenv("STRATA_GLM_CHECK_PREFILL_REPEAT");
+            if (repeat_check && std::string(repeat_check) != "0" && std::string(repeat_check) != "1")
+                throw std::invalid_argument("GLM: prefill repeat check must be 0 or 1");
+            const bool check_repeat = repeat_check && std::string(repeat_check) == "1";
+            std::vector<float> first_prefill;
             if (repetitions > 1) {
                 decoder.reset();
-                prefill(prefill_batch);
+                auto warmup_logits = prefill(prefill_batch);
+                if (check_repeat) first_prefill = std::move(warmup_logits);
             }
             for (int trial = 0; trial < repetitions; ++trial) {
                 decoder.reset();
@@ -9803,6 +9941,19 @@ int main(int argc, char **argv) {
                 logits = prefill(prefill_batch);
                 if (profile_prefill && trial == 0) check(cudaProfilerStop());
                 double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+                if (check_repeat) {
+                    if (first_prefill.empty()) first_prefill = logits;
+                    if (logits != first_prefill) {
+                        double maximum = 0;
+                        if (logits.size() == first_prefill.size())
+                            for (size_t i = 0; i < logits.size(); ++i)
+                                maximum = std::max(maximum, std::abs(double(logits[i]) - first_prefill[i]));
+                        std::cerr << "PREFILL_REPEAT trial=" << trial << " identical=0 max_abs=" << maximum << '\n';
+                        task_trace("prefill_repeat_mismatch", (int)tokens.size(), trial);
+                        throw std::runtime_error("GLM: repeated prefill logits differ from the first prefill");
+                    }
+                    std::cerr << "PREFILL_REPEAT trial=" << trial << " identical=1\n";
+                }
                 std::cerr << "PREFILL trial=" << trial << " tokens=" << tokens.size()
                           << " batch=" << prefill_batch << " ms=" << ms
                           << " tok_s=" << tokens.size() * 1000 / ms << '\n';
@@ -9851,6 +10002,27 @@ int main(int argc, char **argv) {
             output.write((const char *)logits.data(), logits.size() * sizeof(float));
             if (!output) throw std::runtime_error("GLM: failed to write prefill logits: " + dump_prefill);
         }
+        if (check_eval_stream) {
+            task_trace("eval_stream_check_begin", (int)tokens.size(), 32);
+            const bool old_tier=decoder.set_tier_adaptation(false);
+            decoder.set_decode_cache_adapt(false);
+            auto cp=decoder.checkpoint();decoder.save(cp);
+            std::vector<int> window(32);
+            for(size_t i=0;i<window.size();++i)window[i]=(int)i+17;
+            const auto expected=decoder.batch(window,true,true);
+            decoder.restore(cp);
+            std::vector<float> streamed;
+            decoder.batch(window,true,true,[&](const float* rows,int first,int count) {
+                if(streamed.size()!=(size_t)first*decoder.vocabulary())
+                    throw std::runtime_error("GLM: streamed evaluation panel order differs");
+                streamed.insert(streamed.end(),rows,rows+(size_t)count*decoder.vocabulary());
+            });
+            if(streamed!=expected)throw std::runtime_error("GLM: streamed evaluation logits differ");
+            decoder.restore(cp);decoder.set_tier_adaptation(old_tier);
+            decoder.set_decode_cache_adapt(decode_cache_adapt);
+            std::cerr<<"EVAL_STREAM panels=4 rows=32 all_logits=bitwise_equal\n";
+            task_trace("eval_stream_check_complete", (int)tokens.size(), 32);
+        }
         const bool mtp_prepared_for_cache = use_mtp && decoder.prepare_mtp_for_cache(tokens, draft_depth);
         // Own retained rollback history before sizing the tier. Lookup has no draft block,
         // but rejected windows still need the same target-state recovery as MTP.
@@ -9859,33 +10031,50 @@ int main(int argc, char **argv) {
             decoder.enable_verify_history(lookup_depth);
         decoder.probe_decode_cache(logits, stops);
         const auto cache_prepare_start = std::chrono::steady_clock::now();
+        task_trace("decode_cache_prepare_begin", (int)tokens.size(), 1);
         decoder.prepare_decode_cache();
+        task_trace("decode_cache_prepare_complete", (int)tokens.size(), 1);
         decoder.freeze_cache();
         std::cerr << "RESPONSE_PREPARE kind=decode_cache ms=" <<
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cache_prepare_start).count() << '\n';
         decoder.check_exact_cache(logits);
         if (check_decode_graphs) {
+            task_trace("decode_graph_check_begin", (int)tokens.size(), 8);
             // Compare identical resident slots; adaptation resumes only after
             // the checkpoint is restored, so cache arithmetic cannot drift.
+            const bool old_tier = decoder.set_tier_adaptation(false);
             decoder.set_decode_cache_adapt(false);
             auto cp = decoder.checkpoint();
             decoder.save(cp);
             const std::vector<int> window{greedy(logits), 11, 9647, 0, 1, 2, 3, 4};
             std::vector<std::vector<float>> expected;
-            const bool check_device_experts = decoder.uses_device_experts();
-            decoder.set_device_experts(false);
+            // Keep expert placement fixed as well as the tier contents. With
+            // residency-biased routing or deferred CPU experts, moving resident
+            // experts to the CPU changes the target, independently of graphs.
             decoder.set_decode_graphs(false);
             for (int token : window) expected.push_back(decoder.step(token));
             decoder.restore(cp);
             decoder.set_decode_graphs(true);
-            decoder.set_device_experts(check_device_experts);
-            for (size_t i = 0; i < window.size(); ++i)
-                if (decoder.step(window[i]) != expected[i])
+            for (size_t i = 0; i < window.size(); ++i) {
+                const auto actual = decoder.step(window[i]);
+                if (actual != expected[i]) {
+                    size_t different = 0; float max_error = 0;
+                    for (size_t j = 0; j < actual.size(); ++j) {
+                        different += actual[j] != expected[i][j];
+                        max_error = std::max(max_error, std::abs(actual[j] - expected[i][j]));
+                    }
+                    std::cerr << "DECODE_GRAPH_MISMATCH step=" << i << " logits=" << different
+                              << " max_abs=" << max_error << " greedy_equal="
+                              << (greedy(actual) == greedy(expected[i])) << '\n';
                     throw std::runtime_error("GLM: CUDA graph decode logits differ from direct launches");
+                }
+            }
             decoder.restore(cp);
+            decoder.set_tier_adaptation(old_tier);
             decoder.set_decode_graphs(decode_graphs);
             decoder.set_decode_cache_adapt(decode_cache_adapt);
             std::cerr << "DECODE_GRAPHS eight sequential logits and rollback identical\n";
+            task_trace("decode_graph_check_complete", (int)tokens.size(), 8);
             if (std::getenv("STRATA_GLM_CHECK_TIER_ADAPT")) {
                 const bool old_tier = decoder.set_tier_adaptation(false);
                 decoder.save(cp);
@@ -9961,6 +10150,12 @@ int main(int argc, char **argv) {
             auto cp = decoder.checkpoint();
             decoder.save(cp);
             std::vector<int> window{greedy(logits), 11, 9647, 0, 1, 2, 3, 4};
+            if (const char *value = std::getenv("STRATA_GLM_CHECK_VERIFY_WIDTH")) {
+                size_t end = 0; const int width = std::stoi(value, &end);
+                if (value[end] || width < 1 || width > cpu::MAXT)
+                    throw std::invalid_argument("GLM: verification check width must be 1..8");
+                window.resize(width);
+            }
             std::vector<float> expected;
             for (int token : window) {
                 auto row = decoder.step(token);
@@ -9986,7 +10181,7 @@ int main(int argc, char **argv) {
                 auto retained = decoder.verify(window);
                 if (retained != expected)
                     throw std::runtime_error("GLM: retained verification logits differ from sequential decode");
-                for (int n = 1; n <= decoder.verify_history_slots(); ++n) {
+                for (int n = 1; n <= std::min<int>(decoder.verify_history_slots(), window.size()); ++n) {
                     decoder.restore(cp);
                     decoder.batch(std::vector<int>(window.begin(), window.begin() + n), false);
                     auto expected_next = decoder.step(17);
@@ -10092,13 +10287,14 @@ int main(int argc, char **argv) {
             std::cerr << "MTP_PRIME ms=" << std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count() << '\n';
         }
+        if (mtp_greedy_control) std::cerr << "MTP_CONTROL prepared_target_and_draft ordinary_greedy=1\n";
         std::unique_ptr<Decoder::Snapshot> decode_start_state;
         const auto decode_start_logits = logits;
         if (decode_repetitions > 1 || decode_mode_sweep) decode_start_state = std::make_unique<Decoder::Snapshot>(decoder.snapshot());
         const int modes = decode_mode_sweep ? (decode_mtp_sweep ? 4 : 7) : 1;
         for (int mode_index = 0; mode_index < modes; ++mode_index) {
             const int mode = decode_mtp_sweep && mode_index ? mode_index + 3 : mode_index;
-            const bool trial_mtp = decode_mode_sweep ? mode >= 4 : use_mtp;
+            const bool trial_mtp = decode_mode_sweep ? mode >= 4 : use_mtp && !mtp_greedy_control;
             const int trial_lookup = decode_mode_sweep ? (mode >= 1 && mode <= 3 ? mode : 0) : lookup_depth;
             const int trial_depth = decode_mode_sweep ? mode - 3 : draft_depth;
             if (decode_mode_sweep) std::cerr << "DECODE_MODE source=" << (trial_mtp ? "mtp" : trial_lookup ? "lookup" : "none")
