@@ -837,7 +837,7 @@ class StrataEngine:
                 "smaller model (Q2_0 / IQ2_XS).")
 
     def alive(self) -> bool:
-        proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
+        proc = getattr(self, "proc", None)               # read once: restart() / close() may set it to None meanwhile
         return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
 
     def exit_code(self):
@@ -1911,7 +1911,7 @@ def vision_start_error(line: str, log=None) -> str:
 
 
 class GlmEngine(StrataEngine):
-    """Experimental GLM resident process; greedy text requests only."""
+    """Experimental GLM resident process with dynamic temperature and top-p sampling."""
 
     # GLM has no reusable prefix cache. Admit parallel requests directly into slots:
     # promotion would re-prefill generated tokens and can change rounding and logits.
@@ -1928,22 +1928,32 @@ class GlmEngine(StrataEngine):
                    "repeat_penalty": 1, "typical_p": 1, "mirostat": 0, "dyn_temp_range": 0}
         # The caller passes the entire API request, including model/messages/stream.
         settings = sampling or {}
-        sampling_fields = (*neutral, "seed", "penalty_last_n")
+        keys = ""
+        t = settings.get("temperature")
+        if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) > 0.0:
+            keys += f" temperature={float(t)!r}"
+        tp = settings.get("top_p")
+        if isinstance(tp, (int, float)) and 0.0 < float(tp) < 1.0:
+            keys += f" top_p={float(tp)!r}"
+        tk = settings.get("top_k")
+        if isinstance(tk, int) and not isinstance(tk, bool) and tk > 0:
+            keys += f" top_k={tk}"
+        seed = settings.get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool) and seed >= 0:
+            keys += f" seed={seed}"
+        # The GLM sampler has no penalties, min-p, typical-p or mirostat: a non-neutral value is refused, not ignored.
         penalised = any(settings.get(k) not in (None, neutral[k])
                         for k in ("repetition_penalty", "frequency_penalty", "presence_penalty", "repeat_penalty"))
-        for key in sampling_fields:
+        for key in ("min_p", "repetition_penalty", "frequency_penalty", "presence_penalty", "repeat_penalty",
+                    "typical_p", "mirostat", "dyn_temp_range", "penalty_last_n"):
             value = settings.get(key)
             if value is None:
                 continue
-            if key == "seed" and isinstance(value, int) and value <= 0:   # unset (-1 / 0), as for the other engines
-                continue
             if key == "penalty_last_n" and not penalised:   # a window with no penalty changes nothing
                 continue
-            if key == "top_k" and value == -1:   # llama.cpp's "no limit"
-                continue
             if key not in neutral or value != neutral[key]:
-                raise ValueError(f"GLM currently supports greedy decoding only; unsupported setting {key}")
-        return ""
+                raise ValueError(f"GLM sampling does not support {key}")
+        return keys
 
     def session_file(self, action, path):
         # The GLM engine has no SAVE/RESTORE: sending one would desynchronize its line protocol and end it.
@@ -6226,7 +6236,7 @@ def main() -> int:
         args = [cfg["model"], str(context), str(cfg.get("dense_cache_mib", 4096)),
                 str(cfg.get("threads", 15 if glm_native else 6)), str(cfg.get("expert_cache_mib", 0)),
                 str(cfg.get("prefill_batch", 256 if glm_native else 8)), ",".join(map(str, sorted(glm_stop_ids))), str(cfg.get("gpu_budget_mib", 10240 if glm_native else 12288)), str(cfg.get("lookup_depth", 3 if cfg.get("speculative") == "lookup" else 0)), str(int(cfg.get("decode_experts", "cpu") == "gpu")), cfg.get("speculative", "none"), str(cfg.get("draft_depth", 3)), cfg.get("cpu_affinity", "numa" if glm_native else "none"), str(cfg.get("cpu_prepack_mib", 0))]
-        devices = cfg.get("gpu_devices", "0")
+        devices = cfg.get("gpu_devices", cfg.get("gpu", "0"))
         if isinstance(devices, list): devices = ",".join(map(str, devices))
         args.extend((str(devices), str(cfg.get("prefill_expert_cache_mib", 0)), str(int(bool(cfg.get("lock_weights", False)))),
                      str(int(bool(cfg.get("decode_prefill_cache", False)))), str(cfg.get("decode_cache_mib", 0)), str(int(bool(cfg.get("decode_graphs", False)))), str(cfg.get("decode_cache_window", 256)),
@@ -6255,7 +6265,16 @@ def main() -> int:
             while len(args) < 27:
                 args.append(defaults[len(args) - 22])
             args += batch_args
-        engine = GlmEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
+        c_env = child_env(cfg)
+        if "layer_split" in cfg:
+            try:
+                split = layer_split_value(cfg)          # #644: the same format check as the strata engine
+            except ValueError as e:
+                raise SystemExit(f"[glm] config {e}")
+            if split != "auto":
+                print(f"[glm] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+            c_env["STRATA_LAYER_SPLIT"] = split
+        engine = GlmEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=c_env)
         vision, sampling_defaults = None, {}
     elif a.engine == "strata":
         if not cfg:

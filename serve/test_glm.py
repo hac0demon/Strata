@@ -51,12 +51,11 @@ class GlmBoundary(unittest.TestCase):
 
     def test_sampling_rejected_before_engine_write(self):
         engine = GlmEngine.__new__(GlmEngine)
-        # There is deliberately no process: invalid settings must fail before IO.
-        with self.assertRaisesRegex(ValueError, "greedy"):
-            list(engine.generate([1], 2, {"temperature": 0.7}, threading.Event()))
         with self.assertRaisesRegex(ValueError, "text"):
             list(engine.generate([1], 2, {}, threading.Event(), embeddings="image"))
         self.assertEqual(GlmEngine.sampling_keys({"temperature": 0, "top_p": 1}), "")
+        self.assertEqual(GlmEngine.sampling_keys({"temperature": 0.7, "top_p": 0.95, "top_k": 20}),
+                         " temperature=0.7 top_p=0.95 top_k=20")
 
     def test_parallel_glm_admits_directly_without_solo_reprefill(self):
         import serve.server as server
@@ -81,9 +80,8 @@ class GlmBoundary(unittest.TestCase):
         request = {"model": "glm-5.3-flash-q2", "messages": [{"role": "user", "content": "hello"}],
                    "stream": True, "max_tokens": 512, "reasoning_effort": "low", "temperature": 0}
         self.assertEqual(GlmEngine.sampling_keys(request), "")
-        for field, value in (("top_p", 0.9), ("seed", 42), ("frequency_penalty", 0.5)):
-            with self.assertRaisesRegex(ValueError, "greedy"):
-                GlmEngine.sampling_keys({**request, field: value})
+        self.assertEqual(GlmEngine.sampling_keys({**request, "temperature": 0.8, "seed": 42}),
+                         " temperature=0.8 seed=42")
 
     def test_gguf_template_and_stop_ids(self):
         engine = GlmEngine.__new__(GlmEngine)

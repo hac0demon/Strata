@@ -2,7 +2,7 @@
   "exe": "build-glm/strata-glm-decode",
   "model": "/home/main/models/GLM/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf",
   "model_name": "GLM-5.3-Flash",
-  "context": 8192,
+  "context": 28192,
   "dense_cache_mib": 4096,
   "gpu_budget_mib": 31744,
   "gpu_devices": "0,1",
