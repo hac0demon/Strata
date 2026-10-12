@@ -65,6 +65,7 @@ build-vision-cuda12.bat
 .cursor/
 
 /.ccache/
+/.cache/
 /.rocm-win/
 
 # Local coding-agent handoff; keep out of version control.

@@ -1,0 +1,30 @@
+{
+  "exe": "build-glm/strata-glm-decode",
+  "model": "/home/main/models/GLM/UD-IQ2_XXS/GLM-5.3-Flash-UD-IQ2_XXS-00001-of-00004.gguf",
+  "model_name": "GLM-5.3-Flash",
+  "context": 8192,
+  "dense_cache_mib": 4096,
+  "gpu_budget_mib": 31744,
+  "gpu_devices": "0,1",
+  "layer_split": "auto",
+  "threads": 15,
+  "cpu_affinity": "auto",
+  "prefill_batch": 2048,
+  "decode_experts": "cpu",
+  "speculative": "mtp",
+  "draft_depth": 1,
+  "decode_graphs": true,
+  "decode_prefill_cache": true,
+  "prefill_expert_cache_mib": "auto",
+  "env": {
+    "STRATA_GLM_QUANT_ONCE": "1",
+    "STRATA_NATIVE_NUMA_LOCAL": "0",
+    "STRATA_POOL_SPIN_US": "20000",
+    "STRATA_IQ2_TABLE_SIGNS": "1",
+    "STRATA_GLM_LAYER_GRAPHS": "1",
+    "STRATA_GLM_VERIFY_GRAPHS": "1",
+    "STRATA_NATIVE_TASKS_PER_THREAD": "12",
+    "STRATA_GLM_GPU_RESERVE_MIB": "512"
+  },
+  "log": "glm-server-split.log"
+}
