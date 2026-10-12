@@ -60,7 +60,7 @@ def main():
     if args.prompt_file:
         args.prompt = args.prompt_file.read_text(encoding='utf-8')
     metadata = GGUFFile(metadata_shard(args.model)).metadata
-    if metadata.get('general.architecture') != 'glm5next':
+    if metadata.get('general.architecture') not in ('glm5next', 'glm5-next'):
         parser.error('expected a glm5next GGUF')
     tok = Tokenizer.from_gguf(metadata_shard(args.model))
     template = ChatTemplate(source=metadata['tokenizer.chat_template'])

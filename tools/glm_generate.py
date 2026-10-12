@@ -96,7 +96,7 @@ def main():
     ids = tokenizer.encode(prompt, parse_special=True)
     if not ids or args.tokens < 1 or args.dense_cache_mib < 64 or args.expert_cache_mib < 0 or args.threads < 1:
         parser.error("empty prompt or invalid decode settings")
-    model_context = metadata.get("glm5next.context_length", metadata.get("glm5-next.context_length"))
+    model_context = metadata.get("glm5next.context_length") or metadata.get("glm5-next.context_length") or 131072
     if args.context is not None and (args.context < len(ids) + args.tokens or
                                     args.context > model_context):
         parser.error("prompt plus output exceeds the requested or model context")
